@@ -137,7 +137,13 @@ LOG_PATH = "/flash/translator.log"
 LOG_MAX_BYTES = 64 * 1024
 LOG_ROTATE_EVERY = 200
 HTTP_TIMEOUT = 45
-HTTP_THREAD_STACK = 32768
+# Measured on this unit with tools/device_scripts/thread_probe.py: a 32 KB
+# task stack CANNOT be created here and raises OSError("can't create
+# thread") every time, which silently sent every POST down do_post's
+# blocking fallback and disabled touch during network calls. 16 KB creates
+# reliably, and tls_thread_probe.py completed a real TLS handshake and HTTP
+# round trip on stacks down to 8 KB, so this leaves real margin.
+HTTP_THREAD_STACK = 16384
 
 GATE_MIN, GATE_MAX = -70, -25
 CHUNK_MIN, CHUNK_MAX = 3, 15

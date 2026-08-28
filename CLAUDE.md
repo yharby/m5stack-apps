@@ -202,7 +202,13 @@ Measured on this unit, computed from the PCM buffer: quiet room about
   button, slider or meter. `m5ui` is LVGL and would seize the framebuffer.
   Raw `M5.Lcd` calls are the right choice here.
 - `requests2.post` is synchronous, so the app runs each POST on a short-lived
-  `_thread` worker with a verified 32 KB stack. The main thread continues
+  `_thread` worker. **The stack must be 16 KB, not 32 KB.** A 32 KB task stack
+  cannot be allocated on this board and raises `OSError("can't create thread")`
+  every single time, which silently routed every POST down the blocking
+  fallback and disabled touch during network calls. `thread_probe.py` shows
+  16384/8192/4096/2048 create fine and 32768 never does; `tls_thread_probe.py`
+  completed a real TLS handshake and HTTP round trip on stacks down to 8 KB.
+  Re-probe before raising this value again. The main thread continues
   calling `M5.update()` every 20 ms and latches the initial `wasPressed` event,
   allowing one touch to stop or request settings during either network call.
   Do not move POSTs back onto the UI thread: taps that start and end during a
