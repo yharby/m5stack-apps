@@ -11,6 +11,7 @@ so the board is not soft-reset back into that launcher.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import subprocess
 import sys
@@ -58,8 +59,18 @@ def breakin(port: str, attempts: int = 40, quiet: bool = True) -> None:
         s.flush()
         time.sleep(0.3)
         s.read(4000)
+    except (OSError, serial.SerialException) as e:
+        # The port is enumerated but the board is not answering. This is what a
+        # wedge looks like, and there is no EN line on the CoreS3's native USB
+        # CDC, so no software reset can reach it.
+        sys.exit(
+            f"{port} stopped responding ({e}).\n"
+            "The board is wedged. Hold the power button for about six seconds, "
+            "release it, then press it once, and try again."
+        )
     finally:
-        s.close()
+        with contextlib.suppress(Exception):
+            s.close()
     if not quiet:
         print(f"[m5] interrupted UIFlow2 launcher on {port}")
 
@@ -170,6 +181,12 @@ def cmd_run(port: str, args) -> int:
     return mp(port, "run", src).returncode
 
 
+def cmd_run_file(port: str, args) -> int:
+    """Run an arbitrary host-side script on the device, for one-off probes."""
+    breakin(port)
+    return mp(port, "run", args.path).returncode
+
+
 def cmd_selftest(port: str, _args) -> int:
     """Run the on-device end-to-end check (config, wifi, mic, OpenAI)."""
     breakin(port)
@@ -255,6 +272,7 @@ COMMANDS = {
     "autorun": cmd_autorun,
     "rm-app": cmd_rm_app,
     "run": cmd_run,
+    "run-file": cmd_run_file,
     "selftest": cmd_selftest,
     "repl": cmd_repl,
     "reset": cmd_reset,
@@ -271,7 +289,7 @@ def main() -> int:
 
     for name in COMMANDS:
         p = sub.add_parser(name)
-        if name == "cat":
+        if name in ("cat", "run-file"):
             p.add_argument("path")
         if name in ("push", "run", "autorun"):
             p.add_argument("app", nargs="?", help=f"app name (default: {DEFAULT_APP})")
