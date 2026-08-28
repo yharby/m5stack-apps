@@ -22,7 +22,8 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
 # These run on MicroPython, not CPython: the stdlib is a subset, the modules
-# (M5, requests2, audio) only exist on the board, and Japanese full-width
-# punctuation in string literals is intentional.
-"device/*" = ["UP", "B904", "SIM105", "RUF001"]
-"tools/device_scripts/*" = ["UP", "B904", "SIM105", "RUF001"]
+# (M5, requests2, audio) only exist on the board, Japanese full-width
+# punctuation in string literals is intentional, and MicroPython's zip() has
+# no strict= parameter so B905 is unfixable there.
+"device/*" = ["UP", "B904", "B905", "SIM105", "RUF001"]
+"tools/device_scripts/*" = ["UP", "B904", "B905", "SIM105", "RUF001"]
