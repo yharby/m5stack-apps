@@ -13,3 +13,6 @@ __pycache__/
 .code-review-graph/
 .DS_Store
 *.log
+
+# Agent worktrees
+.claude/worktrees/

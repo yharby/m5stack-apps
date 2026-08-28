@@ -41,6 +41,7 @@ import gc
 import io
 import json
 import math
+import os
 import struct
 import sys
 import time
@@ -132,6 +133,9 @@ CFG = {
 
 SAMPLE_RATE = 16000
 LOG_PATH = "/flash/translator.log"
+# /flash is small and the app appends a line per pipeline stage forever.
+LOG_MAX_BYTES = 64 * 1024
+LOG_ROTATE_EVERY = 200
 HTTP_TIMEOUT = 45
 HTTP_THREAD_STACK = 32768
 
@@ -202,14 +206,82 @@ except Exception:
 # ------------------------------------------------------------------ logging
 
 
-def log(msg):
-    line = "[t=%d] %s" % (time.ticks_ms(), msg)
-    print(line)
+_log_file = None
+_log_writes = 0
+
+
+def _open_log():
+    """Hold the log file open across writes.
+
+    The previous version opened and closed the file on every line. That is
+    several milliseconds of flash work each time and the app logs about eight
+    lines per translation turn, all of it on the UI thread.
+    """
+    global _log_file
     try:
-        with open(LOG_PATH, "a") as f:
-            f.write(line + "\n")
+        # Deliberately not a context manager. The handle is held open for the
+        # life of the app and closed by _close_log/_rotate_log.
+        _log_file = open(LOG_PATH, "a")  # noqa: SIM115
+    except Exception:
+        _log_file = None
+    return _log_file
+
+
+def _close_log():
+    global _log_file
+    try:
+        if _log_file is not None:
+            _log_file.close()
     except Exception:
         pass
+    _log_file = None
+
+
+def _rotate_log():
+    """Keep one previous log so /flash cannot fill up during a long session."""
+    global _log_writes
+
+    _log_writes = 0
+    try:
+        size = os.stat(LOG_PATH)[6]
+    except Exception:
+        return
+    if size < LOG_MAX_BYTES:
+        return
+    _close_log()
+    try:
+        os.remove(LOG_PATH + ".1")
+    except Exception:
+        pass
+    try:
+        os.rename(LOG_PATH, LOG_PATH + ".1")
+    except Exception:
+        pass
+    _open_log()
+
+
+def log(msg):
+    global _log_writes
+
+    line = "[t=%d] %s" % (time.ticks_ms(), msg)
+    print(line)
+    f = _log_file
+    if f is None:
+        f = _open_log()
+        if f is None:
+            return
+    try:
+        f.write(line + "\n")
+        # Flush every line instead of buffering in RAM. CLAUDE.md's debugging
+        # loop depends on this file surviving a board wedge, and a wedge is
+        # precisely when an unflushed RAM buffer would be lost.
+        f.flush()
+    except Exception:
+        _close_log()
+        return
+    _log_writes += 1
+    if _log_writes >= LOG_ROTATE_EVERY:
+        _rotate_log()
 
 
 def log_exc(e):
@@ -273,16 +345,54 @@ def save_config():
         log("config: save failed %r" % e)
 
 
+_wifi_tuned = False
+
+
+def tune_wifi(w):
+    """Turn off modem power save, once per boot.
+
+    Power save parks the radio between DTIM beacons, which adds latency and
+    jitter to every API round trip. This app does short interactive sessions,
+    so responsiveness is worth more than the milliamps. The keyword differs
+    between MicroPython ESP32 builds, so try both spellings and accept that
+    neither may exist.
+    """
+    global _wifi_tuned
+
+    if _wifi_tuned:
+        return
+    _wifi_tuned = True
+    for key, value in (("pm", getattr(network.WLAN, "PM_NONE", 0)), ("ps_mode", 0)):
+        try:
+            w.config(**{key: value})
+            log("wifi: power save disabled via %s" % key)
+            return
+        except Exception:
+            continue
+    log("wifi: power save unchanged, no supported config key")
+
+
 def ensure_wifi():
+    """Return True when the station interface is associated.
+
+    Called at boot and again before each session. The fast path is a single
+    isconnected() check, so the per-session cost is negligible, and it turns a
+    dropped link into an immediate message instead of a 45 second HTTP timeout.
+    """
     w = network.WLAN(network.STA_IF)
     w.active(True)
+    tune_wifi(w)
     if w.isconnected():
         return True
     if not CFG["wifi_ssid"]:
         log("wifi: down and no ssid configured")
         return False
     log("wifi: connecting to %s" % CFG["wifi_ssid"])
-    w.connect(CFG["wifi_ssid"], CFG["wifi_pass"])
+    try:
+        w.connect(CFG["wifi_ssid"], CFG["wifi_pass"])
+    except Exception as e:
+        log("wifi: connect failed %r" % e)
+        return False
     deadline = time.ticks_add(time.ticks_ms(), 20000)
     while not w.isconnected():
         M5.update()
@@ -1277,10 +1387,19 @@ def setup():
         pass
 
     load_config()
+
+    # Join at boot rather than lazily on the first POST. A dead link should
+    # say so on screen, not surface later as an opaque 45 second timeout.
+    set_status("Connecting Wi-Fi...")
+    online = ensure_wifi()
+
     probe_channels()
 
     update_display()
-    set_status("Tap screen to start")
+    if online:
+        set_status("Tap screen to start")
+    else:
+        set_status("No Wi-Fi, tap to retry", FG_ALERT)
 
 
 def loop():
@@ -1300,6 +1419,11 @@ def loop():
         set_status("Starting..." if running else "Paused")
 
     if not running:
+        return
+
+    if not ensure_wifi():
+        running = False
+        set_status("Wi-Fi down, tap to retry", FG_ALERT)
         return
 
     try:
