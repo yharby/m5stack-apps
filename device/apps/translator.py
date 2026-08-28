@@ -535,27 +535,132 @@ def draw_frame():
     M5.Lcd.drawLine(0, 31, W - 1, 31, FG_LINE)
     M5.Lcd.drawLine(0, 104, W - 1, 104, FG_LINE)
     draw_gear()
+    # The screen is blank again, so whatever the region cache believes is on
+    # it is gone. Every full clear has to forget it or the next update_display
+    # would skip both regions and leave them empty.
+    invalidate_display()
 
 
-def wrap_text(text, max_px=W - 12):
-    """Wrap with real glyph metrics, which matters for mixed Latin and CJK."""
+# textWidth() is the only real metric this firmware offers and it costs a full
+# glyph walk, so each glyph's advance is measured once and kept. There is no
+# "which font is currently set" query on M5.Lcd, and widths differ between the
+# LCD and an off screen canvas, so the caller names both in the key.
+char_widths = {}
+CHAR_CACHE_MAX = 1500
+
+# Both text regions are double buffered through the vendor documented
+# newCanvas/push path. The canvases are allocated once and reused: allocating
+# per frame would churn the heap while the microphone FIFO is running.
+CANVAS_BPP = 16
+region_canvases = [None, None]
+canvas_ok = True
+
+# What was last actually painted into each region, so an unchanged region is
+# left alone. recognize() calls update_display() while a translation is still
+# on screen, and wiping that region to redraw identical text made it flash.
+region_state = [None, None]
+
+
+def invalidate_display():
+    """Forget what is on screen. Call after anything clears the LCD."""
+    region_state[0] = None
+    region_state[1] = None
+
+
+def release_canvases():
+    """Give up on double buffering permanently and fall back to direct draw."""
+    global canvas_ok
+    canvas_ok = False
+    for i in range(len(region_canvases)):
+        c = region_canvases[i]
+        region_canvases[i] = None
+        if c is not None:
+            # delete() is not documented for this binding, so dropping the
+            # reference and collecting is the reliable half of the teardown.
+            try:
+                c.delete()
+            except Exception:
+                pass
+    char_widths.clear()
+    invalidate_display()
+    gc.collect()
+
+
+def region_canvas(slot, w, h):
+    """Lazily allocate one reusable off screen buffer for a text region."""
+    if not canvas_ok:
+        return None
+    c = region_canvases[slot]
+    if c is not None:
+        return c
+    try:
+        c = M5.Lcd.newCanvas(w, h, CANVAS_BPP, True)
+        # Publish it before the smoke test so a half working canvas is torn
+        # down by release_canvases() rather than leaking.
+        region_canvases[slot] = c
+        # A canvas has no .FONTS and no .COLOR of its own, so exercise exactly
+        # the calls the renderer makes, with an M5.Lcd font passed in, before
+        # trusting it with a frame.
+        c.fillScreen(BG)
+        c.setTextColor(FG_DIM, BG)
+        if font_label is not None:
+            c.setFont(font_label)
+        c.textWidth("M")
+    except Exception as e:
+        log("lcd: canvas unavailable (%r), drawing direct" % e)
+        release_canvases()
+        return None
+    return c
+
+
+def char_width(surface, metrics, ch):
+    """Advance of one glyph on one surface, cached. -1 means no metrics."""
+    key = (metrics, ch)
+    w = char_widths.get(key, -2)
+    if w != -2:
+        return w
+    try:
+        w = surface.textWidth(ch)
+    except Exception:
+        w = -1
+    # Japanese transcripts keep introducing new glyphs, so cap the cache
+    # rather than letting it grow for the life of the session.
+    if len(char_widths) >= CHAR_CACHE_MAX:
+        char_widths.clear()
+    char_widths[key] = w
+    return w
+
+
+def wrap_text(text, max_px=W - 12, surface=None, metrics="lcd"):
+    """Wrap with real glyph metrics, which matters for mixed Latin and CJK.
+
+    Widths are summed per character instead of remeasuring the whole growing
+    line. That measurement was quadratic and ran up to sixteen times a turn,
+    stalling the UI thread for hundreds of milliseconds. These are non kerned
+    bitmap faces, so the per character sum is exact.
+    """
+    if surface is None:
+        surface = M5.Lcd
     lines = []
     line = ""
+    width = 0
     for ch in text:
         if ch == "\n":
             lines.append(line)
             line = ""
+            width = 0
             continue
-        trial = line + ch
-        try:
-            too_wide = M5.Lcd.textWidth(trial) > max_px
-        except Exception:
-            too_wide = len(trial) > 20
+        w = char_width(surface, metrics, ch)
+        # w < 0 means textWidth raised, so keep the old character count rule.
+        too_wide = len(line) + 1 > 20 if w < 0 else width + w > max_px
         if too_wide and line:
             lines.append(line)
             line = ch
+            width = w if w > 0 else 0
         else:
-            line = trial
+            line += ch
+            if w > 0:
+                width += w
     if line:
         lines.append(line)
     return lines
@@ -577,25 +682,48 @@ def lcd_safe_text(text):
     return text
 
 
-def fit_lines(text, candidates, max_px, available):
-    """Choose the largest available font whose wrapped text fits."""
+def fit_lines(text, candidates, max_px, available, surface=None, metrics="lcd"):
+    """Choose the largest available font whose wrapped text fits.
+
+    Each candidate carries its own metrics key because nothing can be asked
+    which font is selected, so the width cache has to be told.
+    """
+    if surface is None:
+        surface = M5.Lcd
     chosen_font, chosen_height, chosen_lines = candidates[-1][0], candidates[-1][1], []
-    for font, line_height in candidates:
+    for font, line_height, key in candidates:
         if font is not None:
-            M5.Lcd.setFont(font)
-        lines = wrap_text(text, max_px)
+            surface.setFont(font)
+        lines = wrap_text(text, max_px, surface, metrics + key)
         chosen_font, chosen_height, chosen_lines = font, line_height, lines
         if len(lines) * line_height <= available:
             break
     return chosen_font, chosen_height, chosen_lines
 
 
-def draw_labeled_region(label_y, text_y, bottom, label, text, color, language, primary):
-    M5.Lcd.fillRect(0, label_y, W, bottom - label_y, BG)
+def render_region(canvas, label_y, text_y, bottom, label, text, color, language, primary):
+    """Paint one region, into an off screen canvas when there is one.
+
+    Canvas coordinates are region relative, so every y is shifted by oy and
+    the finished buffer is pushed back at the region's real origin.
+    """
+    if canvas is None:
+        surface = M5.Lcd
+        # A canvas measures on its own glyph cache, so the LCD and each canvas
+        # get their own key space in the width cache.
+        metrics = "lcd"
+        oy = 0
+        M5.Lcd.fillRect(0, label_y, W, bottom - label_y, BG)
+    else:
+        surface = canvas
+        metrics = "c%d" % label_y
+        oy = label_y
+        canvas.fillScreen(BG)
+
     if font_label is not None:
-        M5.Lcd.setFont(font_label)
-    M5.Lcd.setTextColor(FG_DIM, BG)
-    M5.Lcd.drawString(label, 7, label_y)
+        surface.setFont(font_label)
+    surface.setTextColor(FG_DIM, BG)
+    surface.drawString(label, 7, label_y - oy)
 
     available = bottom - text_y
     # Select the glyph set from the text itself. The transcription API has
@@ -604,30 +732,56 @@ def draw_labeled_region(label_y, text_y, bottom, label, text, color, language, p
     text_language = detect_source(text) if text else language
     shown_text = lcd_safe_text(text)
     if text_language == "ja":
-        candidates = ((font_ja, 26),)
+        candidates = ((font_ja, 26, "ja24"),)
     elif primary:
         candidates = (
-            (font_trans_en, 28),
-            (font_source_en, 22),
-            (font_ui, 19),
-            (font_label, 15),
+            (font_trans_en, 28, "m24"),
+            (font_source_en, 22, "m18"),
+            (font_ui, 19, "m16"),
+            (font_label, 15, "m12"),
         )
     else:
-        candidates = ((font_source_en, 22), (font_ui, 19), (font_label, 15))
-    font, line_height, lines = fit_lines(shown_text or "...", candidates, W - 14, available)
+        candidates = ((font_source_en, 22, "m18"), (font_ui, 19, "m16"), (font_label, 15, "m12"))
+    font, line_height, lines = fit_lines(
+        shown_text or "...", candidates, W - 14, available, surface, metrics
+    )
     if font is not None:
-        M5.Lcd.setFont(font)
-    M5.Lcd.setTextColor(color if text else FG_DIM, BG)
-    y = text_y
+        surface.setFont(font)
+    surface.setTextColor(color if text else FG_DIM, BG)
+    y = text_y - oy
     visible = available // line_height
     for line in lines[:visible]:
-        M5.Lcd.drawString(line, 7, y)
+        surface.drawString(line, 7, y)
         y += line_height
+    if canvas is not None:
+        canvas.push(0, label_y)
+
+
+def draw_labeled_region(slot, label_y, text_y, bottom, label, text, color, language, primary):
+    state = (label, text, color, label_y, text_y, bottom)
+    if region_state[slot] == state:
+        return
+    # Clear first: a failure part way through leaves the region dirty, and the
+    # cache must not claim it is clean.
+    region_state[slot] = None
+    canvas = region_canvas(slot, W, bottom - label_y)
+    if canvas is not None:
+        try:
+            render_region(canvas, label_y, text_y, bottom, label, text, color, language, primary)
+            region_state[slot] = state
+            return
+        except Exception as e:
+            # Never let the buffered path take the screen down with it.
+            log("lcd: canvas draw failed %r, drawing direct" % e)
+            release_canvases()
+    render_region(None, label_y, text_y, bottom, label, text, color, language, primary)
+    region_state[slot] = state
 
 
 def update_display():
     target = last_trans_lang if last_trans else ("ja" if last_src == "en" else "en")
     draw_labeled_region(
+        0,
         35,
         50,
         103,
@@ -638,6 +792,7 @@ def update_display():
         False,
     )
     draw_labeled_region(
+        1,
         108,
         124,
         239,
