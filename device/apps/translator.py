@@ -687,6 +687,72 @@ def settings_page():
 
 # ------------------------------------------------------------------ audio
 
+# M5.Mic's FIFO is two slots deep and cannot be made deeper. Capture is
+# therefore a stream of short frames that the pump folds into a ring, and an
+# utterance ends when the talker stops rather than when a wall clock expires.
+# One second per frame keeps the endpointer responsive while still leaving two
+# seconds of runway in the FIFO if the UI thread stalls on a repaint.
+FRAME_MS = 1000
+FRAME_BYTES = SAMPLE_RATE * 2 * FRAME_MS // 1000
+
+# Levels are measured once per window as each frame lands. The same numbers
+# drive the endpointer, the gate and the silence trim, so the audio is walked
+# exactly once per frame instead of twice per chunk.
+WINDOW_MS = 100
+WINDOW_BYTES = SAMPLE_RATE * 2 * WINDOW_MS // 1000
+WINS_PER_FRAME = FRAME_BYTES // WINDOW_BYTES
+LEVEL_STEP = 4
+
+# A window counts as speech when its RMS clears the gate, or when a short
+# transient peaks well above it. That is the same two part test the fixed
+# chunk used, now applied per 100 ms so one quiet word in a long utterance is
+# no longer averaged into silence.
+GATE_PEAK_MARGIN = 18
+
+# Trailing quiet that closes an utterance, and the minimum speech that makes
+# one worth an API call. 600 ms is a natural sentence gap; 400 ms of speech
+# rejects a cough, a chair or a door.
+ENDPOINT_SILENCE_MS = 600
+MIN_SPEECH_MS = 400
+ENDPOINT_SILENCE_WINS = ENDPOINT_SILENCE_MS // WINDOW_MS
+MIN_SPEECH_WINS = MIN_SPEECH_MS // WINDOW_MS
+
+# Guard kept either side of the trimmed speech so a soft onset or a trailing
+# consonant is never clipped by the window grid.
+TRIM_GUARD_MS = 200
+TRIM_GUARD_BYTES = SAMPLE_RATE * 2 * TRIM_GUARD_MS // 1000
+
+# Upload buffers are preallocated and rotated. The old code returned pcm[:]
+# every turn, a fresh 192 KB object that the multipart build then copied
+# again. M5.Mic never sees a pointer to a pooled buffer.
+UPLOAD_POOL = 2
+
+# Session state for the ring and the endpointer. These live here rather than
+# in the module wide globals block because they are only meaningful while a
+# capture session is armed. Sequence numbers are absolute and only ever
+# increase; the slot for a sequence is seq % ring_slots, which avoids every
+# wraparound comparison bug.
+capture_views = None
+ring_rms = None
+ring_peak = None
+ring_slots = 0
+max_frames = 0
+upload_pool = None
+upload_slot = 0
+head_seq = 0
+tail_seq = 0
+open_seq = 0
+pending_ends = None
+speech_windows = 0
+silence_run = 0
+pump_armed = False
+pump_busy = False
+pump_last_ms = 0
+starved_logged = False
+stalled_logged = False
+overflow_logged = False
+pump_error_logged = False
+
 
 def wav_header(n):
     channels = 1
@@ -732,20 +798,25 @@ def _gain_inplace(buf: ptr16, n: int, g: int):  # noqa: F821
         i += 1
 
 
-def apply_gain(buf):
+def apply_gain(buf, nbytes=None):
+    """Gain the first nbytes of buf in place, defaulting to the whole buffer.
+
+    The upload buffers are pooled at the maximum utterance length, so a
+    trimmed utterance only fills a prefix and only that prefix is worth the
+    viper pass. The buffer itself stays a plain bytearray starting at offset
+    zero, which is what ptr16 wants.
+    """
     g = int(CFG["mic_gain"])
     if g <= 1:
         return
+    n = len(buf) if nbytes is None else nbytes
     t0 = time.ticks_ms()
     try:
-        _gain_inplace(buf, len(buf) // 2, g)
+        _gain_inplace(buf, n // 2, g)
     except Exception as e:
         log("gain: failed %r" % e)
         return
-    log(
-        "gain: x%d over %d samples in %d ms"
-        % (g, len(buf) // 2, time.ticks_diff(time.ticks_ms(), t0))
-    )
+    log("gain: x%d over %d samples in %d ms" % (g, n // 2, time.ticks_diff(time.ticks_ms(), t0)))
 
 
 def boost_analog_gain(code):
@@ -810,6 +881,301 @@ def drain_captures():
         time.sleep_ms(20)
 
 
+def dbfs(amplitude):
+    """Amplitude in 16 bit counts to dBFS, with a floor for digital silence."""
+    if amplitude <= 0:
+        return -99.0
+    return 20.0 * math.log(amplitude / 32768.0, 10)
+
+
+def analyze_frame(pcm, rms_out, peak_out):
+    """RMS and peak dBFS for every window of one completed mono frame.
+
+    channel_dbfs and channel_peak_dbfs each walk the buffer separately. The
+    pump needs both numbers for every frame, so this makes one strided pass
+    and fills two preallocated lists, which also keeps per frame allocation at
+    zero. Roughly 4000 iterations for a one second frame, once per second.
+    """
+    stride = 2 * LEVEL_STEP
+    base = 0
+    w = 0
+    while w < WINS_PER_FRAME:
+        end = base + WINDOW_BYTES
+        total = 0
+        peak = 0
+        n = 0
+        i = base
+        while i < end:
+            v = pcm[i] | (pcm[i + 1] << 8)
+            if v >= 32768:
+                v -= 65536
+            if v < 0:
+                v = -v
+            if v > peak:
+                peak = v
+            total += v * v
+            n += 1
+            i += stride
+        rms_out[w] = dbfs(math.sqrt(total / n)) if n else -99.0
+        peak_out[w] = dbfs(peak)
+        base = end
+        w += 1
+
+
+def utterance_max_seconds():
+    """Ceiling on one utterance, derived from the chunk_seconds tunable.
+
+    chunk_seconds is no longer a fixed slice length, but it is still what the
+    settings stepper moves, so the endpointer's upper bound follows it and
+    turning the stepper down still shortens the longest possible sentence.
+    """
+    s = int(CFG["chunk_seconds"]) + 2
+    if s < 4:
+        s = 4
+    elif s > 12:
+        s = 12
+    return s
+
+
+def begin_capture():
+    """Allocate the frame ring and hand M5.Mic its first two slots."""
+    global capture_buffers, capture_views, ring_rms, ring_peak
+    global ring_slots, max_frames, upload_pool, upload_slot
+    global head_seq, tail_seq, open_seq, pending_ends
+    global speech_windows, silence_run
+    global pump_armed, pump_busy, pump_last_ms
+    global starved_logged, stalled_logged, overflow_logged, pump_error_logged
+
+    max_frames = utterance_max_seconds() * 1000 // FRAME_MS
+    # One finished utterance can be waiting on the network while the next one
+    # is still being spoken, so the ring holds both plus a little slack.
+    ring_slots = max_frames + 6
+    capture_buffers = [bytearray(FRAME_BYTES) for _ in range(ring_slots)]
+    # Built once so copying a frame into the upload buffer never allocates a
+    # temporary slice of the audio.
+    capture_views = [memoryview(b) for b in capture_buffers]
+    ring_rms = [[-99.0] * WINS_PER_FRAME for _ in range(ring_slots)]
+    ring_peak = [[-99.0] * WINS_PER_FRAME for _ in range(ring_slots)]
+    upload_pool = [bytearray(max_frames * FRAME_BYTES) for _ in range(UPLOAD_POOL)]
+    upload_slot = 0
+    head_seq = 0
+    tail_seq = 0
+    open_seq = 0
+    pending_ends = []
+    speech_windows = 0
+    silence_run = 0
+    pump_busy = False
+    pump_last_ms = time.ticks_ms()
+    starved_logged = False
+    stalled_logged = False
+    overflow_logged = False
+    pump_error_logged = False
+
+    log(
+        "pipeline: ring %d x %d bytes, upload %d x %d bytes, utterance max %d s"
+        % (
+            ring_slots,
+            FRAME_BYTES,
+            UPLOAD_POOL,
+            max_frames * FRAME_BYTES,
+            max_frames * FRAME_MS // 1000,
+        )
+    )
+    queue_capture(capture_buffers[0])
+    queue_capture(capture_buffers[1])
+    pump_armed = True
+
+
+def end_capture():
+    """Stop requeueing, let the two raw pointers finish, then drop the ring.
+
+    M5.Mic.end() waits for an in flight buffer instead of cancelling it, and
+    the FIFO stores raw pointers, so every ring slot has to stay rooted until
+    isRecording() reaches zero.
+    """
+    global capture_buffers, capture_views, ring_rms, ring_peak
+    global upload_pool, pending_ends, pump_armed
+
+    pump_armed = False
+    if M5.Mic.isRecording():
+        set_status("Finishing queued audio...", FG_DIM)
+        drain_captures()
+    capture_buffers = None
+    capture_views = None
+    ring_rms = None
+    ring_peak = None
+    upload_pool = None
+    pending_ends = None
+
+
+def report_starvation():
+    """Say once why the FIFO ran dry. The two causes need different fixes.
+
+    Without this the loss is silent: the status still reads Listening while
+    nothing is being recorded.
+    """
+    global starved_logged, stalled_logged
+
+    gap = time.ticks_diff(time.ticks_ms(), pump_last_ms)
+    if gap > FRAME_MS:
+        # Nothing serviced the mic for longer than a whole frame. The usual
+        # cause is a POST that took do_post's blocking fallback, which never
+        # polls, so no amount of pump code can cover it.
+        if not starved_logged:
+            starved_logged = True
+            log("mic: FIFO empty, pump not called for %d ms, audio dropped" % gap)
+    elif not stalled_logged:
+        # The pump is being called promptly and the FIFO is still empty, so
+        # capture itself has stopped. That is a device fault, not scheduling.
+        stalled_logged = True
+        log("mic: FIFO empty although the pump ran %d ms ago" % gap)
+
+
+def report_pump_error(e):
+    global pump_error_logged
+
+    if not pump_error_logged:
+        pump_error_logged = True
+        log("pump: %r" % e)
+
+
+def reserve_ring_room():
+    """Guarantee the slot about to be queued is not still holding audio.
+
+    Once this frame is absorbed the mic owns seq tail+1 and tail+2, so any
+    frame the pipeline has not taken by then has to go. That only happens when
+    the network is far behind, and it is logged once.
+    """
+    global head_seq, open_seq, speech_windows, silence_run, overflow_logged
+
+    limit = tail_seq + 3 - ring_slots
+    if head_seq >= limit:
+        return
+    dropped = limit - head_seq
+    head_seq = limit
+    while pending_ends and pending_ends[0] <= head_seq:
+        pending_ends.pop(0)
+    if open_seq < head_seq:
+        open_seq = head_seq
+        speech_windows = 0
+        silence_run = 0
+    if not overflow_logged:
+        overflow_logged = True
+        log("mic: ring full, dropped %d frames of unsent audio" % dropped)
+
+
+def close_utterance(has_speech):
+    """Hand a finished utterance to the pipeline, or retire a silent one."""
+    global open_seq, head_seq, speech_windows, silence_run
+
+    if tail_seq > open_seq:
+        if has_speech:
+            pending_ends.append(tail_seq)
+            log(
+                "utt: closed %d frames, %d speech windows, %d trailing quiet"
+                % (tail_seq - open_seq, speech_windows, silence_run)
+            )
+        elif not pending_ends and head_seq == open_seq:
+            # Never spoken into, so forget it here rather than spend a copy
+            # and a gate check on it downstream.
+            head_seq = tail_seq
+    open_seq = tail_seq
+    speech_windows = 0
+    silence_run = 0
+
+
+def score_frame(slot):
+    """Fold one frame's window levels into the open utterance."""
+    global speech_windows, silence_run, head_seq, open_seq, last_level
+
+    gate = CFG["gate_dbfs"]
+    transient = gate + GATE_PEAK_MARGIN
+    rms = ring_rms[slot]
+    peak = ring_peak[slot]
+    loudest = -99.0
+    for i in range(WINS_PER_FRAME):
+        r = rms[i]
+        if r > loudest:
+            loudest = r
+        if r >= gate or peak[i] >= transient:
+            speech_windows += 1
+            silence_run = 0
+        else:
+            silence_run += 1
+    last_level = loudest
+
+    frames = tail_seq - open_seq
+    if speech_windows >= MIN_SPEECH_WINS and silence_run >= ENDPOINT_SILENCE_WINS:
+        close_utterance(True)
+    elif frames >= max_frames:
+        close_utterance(speech_windows >= MIN_SPEECH_WINS)
+    elif speech_windows == 0 and open_seq == head_seq and frames > 1:
+        # Nothing but room tone so far. Retire the oldest frame so the ring
+        # never fills with silence, keeping one frame of pre-roll in case a
+        # word starts right on the boundary.
+        head_seq += 1
+        open_seq = head_seq
+        silence_run = 0
+
+
+def absorb_frame():
+    """Take one completed frame, then hand the mic a fresh slot.
+
+    The completed slot is measured before anything is requeued, and the slot
+    given back to the mic is two sequences ahead of it, so no buffer M5.Mic
+    holds a raw pointer to is ever read or written from here. tail_seq only
+    advances after the requeue is accepted, so a rejected requeue retries this
+    same frame instead of walking onto a slot that was never filled.
+    """
+    global tail_seq, head_seq
+
+    slot = tail_seq % ring_slots
+    analyze_frame(capture_buffers[slot], ring_rms[slot], ring_peak[slot])
+    if not pending_ends and head_seq < open_seq:
+        # A closed but silent utterance only becomes reclaimable once the
+        # pipeline has taken everything queued ahead of it.
+        head_seq = open_seq
+    reserve_ring_room()
+    if not M5.Mic.record(capture_buffers[(tail_seq + 2) % ring_slots], SAMPLE_RATE, False):
+        raise RuntimeError("M5.Mic.record failed")
+    tail_seq += 1
+    score_frame(slot)
+
+
+def service_capture():
+    """Keep both M5.Mic slots busy and fold finished frames into the ring.
+
+    poll_session_controls calls this every 20 ms, including from inside
+    do_post's wait loop, so capture survives a multi second network turn. It
+    must never raise: its callers are blocking wait loops where an exception
+    would be almost impossible to trace back to here. It is also allowed to be
+    arbitrarily late, for instance when do_post falls back to a blocking POST;
+    then the FIFO simply drains, audio is lost, and report_starvation says so.
+    """
+    global pump_busy, pump_last_ms
+
+    if not pump_armed or not running or capture_buffers is None:
+        return
+    if pump_busy:
+        return
+    pump_busy = True
+    try:
+        depth = M5.Mic.isRecording()
+        if depth == 0:
+            report_starvation()
+        # 2 - depth is exactly how many queued slots have completed since the
+        # last call, because the pump is the only thing that ever requeues.
+        n = 2 - depth
+        while n > 0:
+            absorb_frame()
+            n -= 1
+    except Exception as e:
+        report_pump_error(e)
+    finally:
+        pump_busy = False
+        pump_last_ms = time.ticks_ms()
+
+
 # ------------------------------------------------------------------ HTTP
 
 
@@ -828,10 +1194,18 @@ class SessionCancelled(Exception):
 
 
 def poll_session_controls():
-    """Update input and latch a stop/settings request during pipeline work."""
+    """Update input, service the mic, and latch a stop/settings request.
+
+    Every blocking wait in the pipeline already calls this every 20 ms, so it
+    is also the only place that can keep M5.Mic's two slot FIFO occupied while
+    a POST is in flight. Without service_capture here both slots complete
+    during a slow turn, the mic goes idle, and audio is dropped while the
+    status still reads Listening.
+    """
     global running, settings_requested
 
     M5.update()
+    service_capture()
     power = BtnPWR.wasClicked()
     pos = press()
     if not power and pos is None:
@@ -1106,49 +1480,124 @@ def translate(text, src):
 # ------------------------------------------------------------------ pipeline
 
 
-def wait_for_front_buffer(estimated_done):
-    """Wait until the oldest of two queued M5.Mic buffers is complete."""
+def wait_for_utterance():
+    """Poll input and the mic pump until the endpointer closes an utterance.
+
+    This replaces the old fixed wall clock wait. Nothing here counts seconds
+    any more; the pump decides when the talker has stopped.
+    """
     shown = -1
-    while True:
+    while running and not pending_ends:
         poll_session_controls()
-        if M5.Mic.isRecording() < 2 or not running:
+        if not running:
             return
-        remaining_ms = time.ticks_diff(estimated_done, time.ticks_ms())
-        remaining = max(0, (remaining_ms + 999) // 1000)
-        if remaining != shown:
-            shown = remaining
-            set_status("Listening  ~%d s" % remaining)
+        held = tail_seq - open_seq if speech_windows else 0
+        if held != shown:
+            shown = held
+            if held:
+                set_status("Listening  %d s" % held)
+            else:
+                set_status("Listening")
         time.sleep_ms(20)
 
 
-def prepare_chunk(pcm):
-    """Gate, gain, and freeze a completed buffer so it can be requeued."""
-    global last_level
+def prepare_chunk(start_seq, end_seq):
+    """Gate, trim, gain and freeze one endpointed utterance for upload.
 
-    level = channel_dbfs(pcm)
-    peak = channel_peak_dbfs(pcm)
+    The returned memoryview is over a pooled buffer that M5.Mic has never been
+    handed a pointer to, so capture keeps running into the ring for the whole
+    upload. Returning a view rather than pcm[:] also removes the fresh 192 KB
+    allocation the old code made on every single turn.
+    """
+    global last_level, upload_slot
+
+    frames = end_seq - start_seq
+    if frames > max_frames:
+        # Defensive. The endpointer closes at max_frames, so this should not
+        # fire; keep the newest audio rather than overrun the pooled buffer.
+        log("rec: clamped %d frames to %d" % (frames, max_frames))
+        start_seq = end_seq - max_frames
+        frames = max_frames
+    total = frames * FRAME_BYTES
+
+    # The pump measured every window as its frame landed, so the gate and the
+    # trim points cost no second pass over the audio. The gate keeps its old
+    # two part shape, RMS over the gate or a transient well above it, but a
+    # single loud window is now enough instead of the whole chunk's average.
+    gate = CFG["gate_dbfs"]
+    transient = gate + GATE_PEAK_MARGIN
+    level = -99.0
+    peak = -99.0
+    first = -1
+    last = -1
+    for w in range(frames * WINS_PER_FRAME):
+        slot = (start_seq + w // WINS_PER_FRAME) % ring_slots
+        j = w % WINS_PER_FRAME
+        r = ring_rms[slot][j]
+        p = ring_peak[slot][j]
+        if r > level:
+            level = r
+        if p > peak:
+            peak = p
+        if r >= gate or p >= transient:
+            if first < 0:
+                first = w
+            last = w
     last_level = level
-    secs = len(pcm) / (SAMPLE_RATE * 2.0)
-    log("rec: %d bytes %.1fs rms=%.1f peak=%.1f dBFS" % (len(pcm), secs, level, peak))
-
-    # Gate on RMS or on a clear transient, so a single short word still passes.
-    if level < CFG["gate_dbfs"] and peak < CFG["gate_dbfs"] + 18:
+    log(
+        "rec: %d bytes %.1fs rms=%.1f peak=%.1f dBFS"
+        % (total, total / (SAMPLE_RATE * 2.0), level, peak)
+    )
+    if first < 0:
         set_status("Too quiet, speak closer", FG_DIM)
-        log("rec: below gate %d dBFS, not uploading" % CFG["gate_dbfs"])
+        log("rec: below gate %d dBFS, not uploading" % gate)
         return None
 
-    apply_gain(pcm)
-    # M5.Mic retains only raw pointers and will overwrite this buffer as soon
-    # as it is requeued. Upload a stable copy while capture continues into the
-    # original. At 15 s this is 480 KB, well inside the measured 8 MB free.
-    return pcm[:]
+    # Trim the room tone either side of the speech. Typically a third to a
+    # half of the bytes, which comes straight off the upload time. The guard
+    # margin keeps a soft onset or a trailing consonant that the window grid
+    # would otherwise cut. Both bounds are multiples of two, so sample
+    # alignment and byte order are preserved.
+    lo = first * WINDOW_BYTES - TRIM_GUARD_BYTES
+    hi = (last + 1) * WINDOW_BYTES + TRIM_GUARD_BYTES
+    if lo < 0:
+        lo = 0
+    if hi > total:
+        hi = total
+    n = hi - lo
+
+    buf = upload_pool[upload_slot]
+    upload_slot = (upload_slot + 1) % UPLOAD_POOL
+    pos = 0
+    seq = start_seq + lo // FRAME_BYTES
+    off = lo % FRAME_BYTES
+    while pos < n:
+        take = FRAME_BYTES - off
+        if take > n - pos:
+            take = n - pos
+        buf[pos : pos + take] = capture_views[seq % ring_slots][off : off + take]
+        pos += take
+        off = 0
+        seq += 1
+
+    apply_gain(buf, n)
+    log("rec: trimmed %d to %d bytes, %.1fs on the wire" % (total, n, n / (SAMPLE_RATE * 2.0)))
+    return memoryview(buf)[:n]
 
 
 def recognize(pcm):
     """Transcribe a stable PCM copy, returning (text, source) or None."""
     global last_orig, last_src
 
-    text, lang = transcribe(pcm)
+    try:
+        text, lang = transcribe(pcm)
+    except TypeError:
+        # transcribe builds the multipart body with `body += pcm`, and pcm is
+        # a memoryview over a pooled buffer. Every MicroPython bytearray we
+        # know of extends from any buffer object, but pay for one copy rather
+        # than lose the utterance if this build disagrees.
+        log("stt: multipart rejected a memoryview, copying")
+        text, lang = transcribe(bytearray(pcm))
     gc.collect()
 
     text = (text or "").strip()
@@ -1184,33 +1633,32 @@ def finish_translation(recognized):
 
 
 def run_session():
-    """Continuously rotate M5.Mic's two FIFO buffers around the API calls."""
-    global capture_buffers
+    """Upload endpointed utterances while the pump keeps the mic ring full."""
+    global head_seq
 
     if M5.Mic.isRecording():
         drain_captures()
-    size = SAMPLE_RATE * int(CFG["chunk_seconds"]) * 2
-    capture_buffers = [bytearray(size), bytearray(size)]
-    cur, nxt = capture_buffers
-    log("pipeline: M5.Mic FIFO 2 x %d bytes, %d s per chunk" % (size, CFG["chunk_seconds"]))
-
-    set_status("Listening  ~%d s" % CFG["chunk_seconds"])
-    queue_capture(cur)
-    queue_capture(nxt)
-    estimated_done = time.ticks_add(time.ticks_ms(), int(CFG["chunk_seconds"]) * 1000)
 
     try:
+        # Inside the try so a rejected first queue still reaches end_capture,
+        # which is the only thing that drains M5.Mic's raw pointers.
+        begin_capture()
+        set_status("Listening")
         while running:
-            wait_for_front_buffer(estimated_done)
+            wait_for_utterance()
             if not running:
                 break
-
-            upload_pcm = prepare_chunk(cur)
-            # The upload owns a stable copy now. Requeue the original before
-            # either API call so both FIFO slots cover the network round trip.
-            queue_capture(cur)
-            cur, nxt = nxt, cur
-            estimated_done = time.ticks_add(estimated_done, int(CFG["chunk_seconds"]) * 1000)
+            if not pending_ends:
+                # reserve_ring_room can retire a queued utterance if the
+                # network fell far enough behind. Go back to listening.
+                continue
+            end_seq = pending_ends.pop(0)
+            start_seq = head_seq
+            upload_pcm = prepare_chunk(start_seq, end_seq)
+            # Retire the frames before anything can poll again. prepare_chunk
+            # is synchronous and never polls, so the pump cannot touch these
+            # ring slots until head_seq has moved past them.
+            head_seq = end_seq
             if upload_pcm is not None:
                 set_status("Listening and transcribing...")
                 recognized = recognize(upload_pcm)
@@ -1221,10 +1669,7 @@ def run_session():
                 finish_translation(recognized)
             gc.collect()
     finally:
-        if M5.Mic.isRecording():
-            set_status("Finishing queued audio...", FG_DIM)
-            drain_captures()
-        capture_buffers = None
+        end_capture()
 
 
 # ------------------------------------------------------------------ lifecycle
