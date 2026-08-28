@@ -1,0 +1,19 @@
+[project]
+name = "m5stack-translator"
+version = "0.1.0"
+description = "Realtime EN<->JA speech translator for M5Stack CoreS3 (UIFlow2 MicroPython)"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "mpremote>=1.29.0",   # device filesystem + REPL over USB serial
+    "esptool>=5.1",       # firmware flash / chip info
+    "pyserial>=3.5",      # raw serial for the REPL break-in
+    "ruff>=0.14.0",       # lint
+]
+
+[tool.ruff]
+line-length = 100
+# device code targets MicroPython, not CPython
+exclude = ["device/"]

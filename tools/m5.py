@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Device control CLI for the M5Stack CoreS3 running UIFlow2 MicroPython.
+
+The one non-obvious thing this handles: UIFlow2 boots into an asyncio launcher
+that owns the serial REPL, so a plain `mpremote` connect fails with
+"could not enter raw repl". Every command here first breaks into the REPL by
+hammering Ctrl-C over raw serial, then talks to the board with `mpremote resume`
+so the board is not soft-reset back into that launcher.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import subprocess
+import sys
+import time
+
+import serial
+
+BAUD = 115200
+DEVICE_APP = "device/main.py"
+REMOTE_APP = ":/flash/main.py"
+REMOTE_LOG = "/flash/translator.log"
+
+
+def find_port() -> str:
+    """Return the CoreS3 serial port, preferring the USB CDC device."""
+    candidates = glob.glob("/dev/cu.usbmodem*") or glob.glob("/dev/cu.usbserial*")
+    if not candidates:
+        sys.exit("No M5Stack serial port found. Plug the CoreS3 in over USB-C.")
+    return min(candidates)
+
+
+def breakin(port: str, attempts: int = 40, quiet: bool = True) -> None:
+    """Interrupt the UIFlow2 launcher so the REPL becomes available."""
+    try:
+        s = serial.Serial(port, BAUD, timeout=0.2)
+    except serial.SerialException as e:
+        sys.exit(f"Cannot open {port}: {e}\nIs another program (UIFlow2 web, screen) holding it?")
+    try:
+        time.sleep(0.2)
+        s.reset_input_buffer()
+        for _ in range(attempts):
+            s.write(b"\x03")
+            s.flush()
+            time.sleep(0.05)
+        time.sleep(0.3)
+        s.write(b"\x02")  # Ctrl-B: leave raw REPL, land on a friendly prompt
+        s.flush()
+        time.sleep(0.3)
+        s.read(4000)
+    finally:
+        s.close()
+    if not quiet:
+        print(f"[m5] interrupted UIFlow2 launcher on {port}")
+
+
+def mp(port: str, *args: str, capture: bool = False) -> subprocess.CompletedProcess:
+    """Run mpremote against an already-interrupted board."""
+    cmd = ["mpremote", "connect", port, "resume", *args]
+    return subprocess.run(cmd, capture_output=capture, text=True, check=False)
+
+
+def remote_exec(port: str, code: str, capture: bool = False) -> subprocess.CompletedProcess:
+    return mp(port, "exec", code, capture=capture)
+
+
+# --------------------------------------------------------------------------- commands
+
+
+def cmd_info(port: str, _args) -> int:
+    breakin(port)
+    print(f"port: {port}")
+    return remote_exec(
+        port,
+        "import sys, os, gc, M5\n"
+        "print('micropython:', sys.version)\n"
+        "print('platform:', sys.platform)\n"
+        "try:\n"
+        "    import esp32; print('uiflow:', esp32.firmware_info()[3])\n"
+        "except Exception as e: print('uiflow: ?', e)\n"
+        "gc.collect()\n"
+        "print('free mem: %d bytes' % gc.mem_free())\n"
+        "print('flash:', os.listdir('/flash'))\n",
+    ).returncode
+
+
+def cmd_ls(port: str, _args) -> int:
+    breakin(port)
+    return remote_exec(
+        port,
+        "import os\n"
+        "def walk(p, d=0):\n"
+        "    try: items = sorted(os.listdir(p))\n"
+        "    except Exception as e:\n"
+        "        print(' '*d, p, 'ERR', e); return\n"
+        "    for it in items:\n"
+        "        fp = p.rstrip('/') + '/' + it\n"
+        "        st = os.stat(fp)\n"
+        "        if st[0] & 0x4000:\n"
+        "            print(' '*d + '[D] ' + fp)\n"
+        "            if d < 6: walk(fp, d+2)\n"
+        "        else:\n"
+        "            print(' '*d + '    %s  %d B' % (fp, st[6]))\n"
+        "walk('/flash')\n",
+    ).returncode
+
+
+def cmd_cat(port: str, args) -> int:
+    breakin(port)
+    return mp(port, "cat", args.path).returncode
+
+
+def cmd_push(port: str, args) -> int:
+    src = args.src or DEVICE_APP
+    dest = args.dest or REMOTE_APP
+    breakin(port)
+    print(f"[m5] {src} -> {dest}")
+    return mp(port, "cp", src, dest).returncode
+
+
+def cmd_run(port: str, args) -> int:
+    """Run the app live; its output streams here. Ctrl-C stops it."""
+    src = args.src or DEVICE_APP
+    breakin(port)
+    print(f"[m5] running {src} on device (Ctrl-C to stop)\n")
+    return mp(port, "run", src).returncode
+
+
+def cmd_repl(port: str, _args) -> int:
+    breakin(port)
+    return mp(port, "repl").returncode
+
+
+def cmd_reset(port: str, _args) -> int:
+    breakin(port)
+    print("[m5] resetting into UIFlow2")
+    return remote_exec(port, "import machine; machine.reset()").returncode
+
+
+def cmd_logs(port: str, args) -> int:
+    breakin(port)
+    return remote_exec(
+        port,
+        "try:\n"
+        f"    f = open('{REMOTE_LOG}')\n"
+        "    lines = f.read().splitlines()\n"
+        "    f.close()\n"
+        f"    print('\\n'.join(lines[-{args.lines}:]))\n"
+        "except OSError:\n"
+        "    print('no log file yet')\n",
+    ).returncode
+
+
+def cmd_clear_logs(port: str, _args) -> int:
+    breakin(port)
+    return remote_exec(
+        port,
+        f"import os\ntry:\n    os.remove('{REMOTE_LOG}')\n    print('log cleared')\n"
+        "except OSError: print('no log file')\n",
+    ).returncode
+
+
+def cmd_probe(port: str, _args) -> int:
+    """Smoke-test the hardware the app depends on."""
+    breakin(port)
+    return remote_exec(
+        port,
+        "import struct, math, json, network\n"
+        "print('--- config ---')\n"
+        "cfg = None\n"
+        "for p in ('/flash/config.json','/flash/res/config.json'):\n"
+        "    try:\n"
+        "        f=open(p); cfg=json.loads(f.read()); f.close()\n"
+        "        print('found', p, '| key:', 'yes' if cfg.get('openai_api_key') else 'NO')\n"
+        "        break\n"
+        "    except Exception: pass\n"
+        "if cfg is None: print('NO CONFIG FOUND')\n"
+        "print('--- wifi ---')\n"
+        "w = network.WLAN(network.STA_IF); w.active(True)\n"
+        "print('connected:', w.isconnected(), w.ifconfig()[0] if w.isconnected() else '')\n"
+        "print('--- display ---')\n"
+        "import M5\n"
+        "M5.begin()\n"
+        "M5.Lcd.setFont(M5.Lcd.FONTS.AlibabaSansJA24)\n"
+        "print('JA font width test:', M5.Lcd.textWidth('\\u3053\\u3093\\u306b\\u3061\\u306f'))\n"
+        "print('--- mic ---')\n"
+        "from audio import Recorder\n"
+        "r = Recorder(16000, 16, False)\n"
+        "b = r.create_pcm_buf(1)\n"
+        "r.record_into(b, sync=True)\n"
+        "n = len(b)//2; acc = 0\n"
+        "for i in range(0, n, 7):\n"
+        "    v = struct.unpack_from('<h', b, i*2)[0]; acc += v*v\n"
+        "print('captured %d bytes, rms=%.1f' % (len(b), math.sqrt(acc/(n//7))))\n",
+    ).returncode
+
+
+COMMANDS = {
+    "info": cmd_info,
+    "ls": cmd_ls,
+    "cat": cmd_cat,
+    "push": cmd_push,
+    "run": cmd_run,
+    "repl": cmd_repl,
+    "reset": cmd_reset,
+    "logs": cmd_logs,
+    "clear-logs": cmd_clear_logs,
+    "probe": cmd_probe,
+}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--port", help="serial port (default: autodetect)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    for name in COMMANDS:
+        p = sub.add_parser(name)
+        if name == "cat":
+            p.add_argument("path")
+        if name in ("push", "run"):
+            p.add_argument("src", nargs="?")
+        if name == "push":
+            p.add_argument("dest", nargs="?")
+        if name == "logs":
+            p.add_argument("-n", "--lines", type=int, default=40)
+
+    args = ap.parse_args()
+    port = args.port or find_port()
+    return COMMANDS[args.cmd](port, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

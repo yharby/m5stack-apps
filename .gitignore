@@ -1,0 +1,15 @@
+# secrets - never commit real credentials
+device/config.json
+config.json
+*.key
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+
+# tooling
+.code-review-graph/
+.DS_Store
+*.log
