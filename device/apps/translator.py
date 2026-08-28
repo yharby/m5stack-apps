@@ -2137,6 +2137,12 @@ def setup():
 
     probe_channels()
 
+    # Open the TLS connection now, while the user is still reading the idle
+    # screen. The first POST after boot otherwise pays DNS plus a full cold
+    # handshake, which was measured at about 33 seconds on this board.
+    if online:
+        prewarm()
+
     update_display()
     if online:
         set_status("Tap screen to start")
