@@ -201,8 +201,12 @@ Measured on this unit, computed from the PCM buffer: quiet room about
 - `widgets.Button` is an empty stub that draws nothing. `M5.Widgets` has no
   button, slider or meter. `m5ui` is LVGL and would seize the framebuffer.
   Raw `M5.Lcd` calls are the right choice here.
-- Taps that start and end during a blocking `requests2.post` are lost, and a
-  finger held across one is misreported as a hold.
+- `requests2.post` is synchronous, so the app runs each POST on a short-lived
+  `_thread` worker with a verified 32 KB stack. The main thread continues
+  calling `M5.update()` every 20 ms and latches the initial `wasPressed` event,
+  allowing one touch to stop or request settings during either network call.
+  Do not move POSTs back onto the UI thread: taps that start and end during a
+  blocking request are otherwise lost.
 
 ## HTTP and OpenAI
 

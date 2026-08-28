@@ -36,6 +36,7 @@ API choices, verified against the live API from this device:
   * max_completion_tokens, not the deprecated max_tokens.
 """
 
+import _thread
 import gc
 import io
 import json
@@ -132,6 +133,7 @@ CFG = {
 SAMPLE_RATE = 16000
 LOG_PATH = "/flash/translator.log"
 HTTP_TIMEOUT = 45
+HTTP_THREAD_STACK = 32768
 
 GATE_MIN, GATE_MAX = -70, -25
 CHUNK_MIN, CHUNK_MAX = 3, 15
@@ -168,6 +170,8 @@ FG_TEXT = 0xFFFFFF
 FG_PANEL = 0x303030
 
 GEAR_BOX = (288, 1, 32, 30)
+# Keep the icon compact, but give a fingertip a full 44 x 44 px target.
+GEAR_HIT_BOX = (276, 0, 44, 44)
 
 BOUNDARY = "----M5CoreS3TranslatorBoundary"
 
@@ -185,6 +189,14 @@ font_source_en = None
 font_trans_en = None
 capture_buffers = None
 settings_requested = False
+
+# requests2 is synchronous. Run it on a Python worker so the main thread can
+# keep M5.update() moving and latch touch presses during TLS/network waits.
+# This stack size was verified with requests2 TLS on the target UIFlow2 build.
+try:
+    _thread.stack_size(HTTP_THREAD_STACK)
+except Exception:
+    pass
 
 
 # ------------------------------------------------------------------ logging
@@ -354,6 +366,16 @@ def tap():
         return None
     d = M5.Touch.getDetail(0)
     if d[6]:  # wasClicked
+        return (M5.Touch.getX(), M5.Touch.getY())
+    return None
+
+
+def press():
+    """Touch position on initial contact, without waiting for release."""
+    if M5.Touch.getCount() == 0:
+        return None
+    d = M5.Touch.getDetail(0)
+    if d[5]:  # wasPressed
         return (M5.Touch.getX(), M5.Touch.getY())
     return None
 
@@ -801,12 +823,84 @@ class ApiError(Exception):
         return "HTTP %d" % self.status
 
 
-def do_post(url, **kw):
+class SessionCancelled(Exception):
+    """A touch or power-button press stopped an in-flight session."""
+
+
+def poll_session_controls():
+    """Update input and latch a stop/settings request during pipeline work."""
+    global running, settings_requested
+
+    M5.update()
+    power = BtnPWR.wasClicked()
+    pos = press()
+    if not power and pos is None:
+        return False
+
+    running = False
+    if pos and hit(pos[0], pos[1], GEAR_HIT_BOX):
+        settings_requested = True
+        set_status("Opening settings...", FG_DIM)
+        log("touch: settings requested")
+    else:
+        set_status("Stopping...", FG_DIM)
+        log("touch: stop requested")
+    return True
+
+
+def _blocking_post(url, kw):
     """requests2 accepts an undocumented timeout=, fall back if it ever stops."""
     try:
         return requests2.post(url, timeout=HTTP_TIMEOUT, **kw)
     except TypeError:
         return requests2.post(url, **kw)
+
+
+def _post_worker(result, url, kw):
+    """Publish a response or exception into a small cross-thread mailbox."""
+    try:
+        value = _blocking_post(url, kw)
+        result[1] = value
+        result[0] = 1
+    except BaseException as e:
+        result[1] = e
+        result[0] = -1
+
+
+def do_post(url, **kw):
+    """POST without starving display/touch updates on the main thread."""
+    result = [0, None]
+    try:
+        _thread.start_new_thread(_post_worker, (result, url, kw))
+    except Exception as e:
+        # The ESP32 port can transiently reject a task while old resources are
+        # settling. Collect and retry once before sacrificing UI polling.
+        log("http: worker start retry after %r" % e)
+        gc.collect()
+        time.sleep_ms(50)
+        try:
+            _thread.start_new_thread(_post_worker, (result, url, kw))
+        except Exception as retry_error:
+            # Preserve network functionality if task allocation is genuinely
+            # unavailable, though this one fallback call cannot service touch.
+            log("http: worker unavailable %r; using blocking POST" % retry_error)
+            return _blocking_post(url, kw)
+
+    while result[0] == 0:
+        poll_session_controls()
+        time.sleep_ms(20)
+
+    if not running:
+        if result[0] > 0:
+            try:
+                result[1].close()
+            except Exception:
+                pass
+        raise SessionCancelled()
+    if result[0] < 0:
+        raise result[1]
+    response = result[1]
+    return response
 
 
 def classify(r):
@@ -850,7 +944,12 @@ def post_with_retry(label, make_post, attempts=3):
         except Exception:
             pass
         log("%s: retrying in %ds" % (label, wait))
-        time.sleep(wait)
+        deadline = time.ticks_add(time.ticks_ms(), wait * 1000)
+        while time.ticks_diff(deadline, time.ticks_ms()) > 0:
+            poll_session_controls()
+            if not running:
+                raise SessionCancelled()
+            time.sleep_ms(20)
         delay *= 2
     raise ApiError(0, "unreachable", False)
 
@@ -1009,21 +1108,9 @@ def translate(text, src):
 
 def wait_for_front_buffer(estimated_done):
     """Wait until the oldest of two queued M5.Mic buffers is complete."""
-    global running, settings_requested
     shown = -1
     while True:
-        M5.update()
-        if BtnPWR.wasClicked():
-            running = False
-        pos = tap()
-        if pos:
-            if hit(pos[0], pos[1], GEAR_BOX):
-                settings_requested = True
-                running = False
-                set_status("Opening settings after capture...", FG_DIM)
-            else:
-                running = False
-                set_status("Stopping after queued audio...", FG_DIM)
+        poll_session_controls()
         if M5.Mic.isRecording() < 2 or not running:
             return
         remaining_ms = time.ticks_diff(estimated_done, time.ticks_ms())
@@ -1201,7 +1288,7 @@ def loop():
     M5.update()
 
     pos = tap()
-    if pos and hit(pos[0], pos[1], GEAR_BOX):
+    if pos and hit(pos[0], pos[1], GEAR_HIT_BOX):
         settings_page()
         set_status("Tap screen to start" if not running else "Listening...")
         return
@@ -1217,6 +1304,11 @@ def loop():
 
     try:
         run_session()
+    except SessionCancelled:
+        running = False
+        log("pipeline: cancelled by user")
+        if not settings_requested:
+            set_status("Paused")
     except ApiError as e:
         log_exc(e)
         running = False
