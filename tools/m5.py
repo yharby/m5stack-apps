@@ -19,9 +19,17 @@ import time
 import serial
 
 BAUD = 115200
-DEVICE_APP = "device/main.py"
-REMOTE_APP = ":/flash/main.py"
+APPS_DIR = "device/apps"  # host-side source of truth, one file per app
+REMOTE_APPS = "/flash/apps"  # what the device APP.LIST menu shows
+REMOTE_AUTORUN = "/flash/main.py"  # what the device runs on boot / APP.RUN
+DEFAULT_APP = "translator"
 REMOTE_LOG = "/flash/translator.log"
+SELFTEST = "tools/device_scripts/selftest.py"
+
+
+def app_paths(name: str) -> tuple[str, str]:
+    """(host source path, device destination path) for a named app."""
+    return f"{APPS_DIR}/{name}.py", f"{REMOTE_APPS}/{name}.py"
 
 
 def find_port() -> str:
@@ -113,19 +121,60 @@ def cmd_cat(port: str, args) -> int:
 
 
 def cmd_push(port: str, args) -> int:
-    src = args.src or DEVICE_APP
-    dest = args.dest or REMOTE_APP
+    """Install an app into /flash/apps/<name>.py so APP.LIST shows it by name."""
+    name = args.app or DEFAULT_APP
+    src, dest = app_paths(name)
     breakin(port)
     print(f"[m5] {src} -> {dest}")
-    return mp(port, "cp", src, dest).returncode
+    return mp(port, "cp", src, ":" + dest).returncode
+
+
+def cmd_autorun(port: str, args) -> int:
+    """Also install the app as /flash/main.py so it runs on boot."""
+    name = args.app or DEFAULT_APP
+    src, _ = app_paths(name)
+    breakin(port)
+    print(f"[m5] {src} -> {REMOTE_AUTORUN} (runs on boot)")
+    return mp(port, "cp", src, ":" + REMOTE_AUTORUN).returncode
+
+
+def cmd_apps(port: str, _args) -> int:
+    """List the apps installed on the device."""
+    breakin(port)
+    return remote_exec(
+        port,
+        "import os\n"
+        f"for f in sorted(os.listdir('{REMOTE_APPS}')):\n"
+        f"    st = os.stat('{REMOTE_APPS}/' + f)\n"
+        "    print('  %-24s %6d B' % (f, st[6]))\n",
+    ).returncode
+
+
+def cmd_rm_app(port: str, args) -> int:
+    name = args.app
+    _, dest = app_paths(name)
+    breakin(port)
+    return remote_exec(
+        port,
+        f"import os\ntry:\n    os.remove('{dest}')\n    print('removed {dest}')\n"
+        "except OSError as e: print('not removed:', e)\n",
+    ).returncode
 
 
 def cmd_run(port: str, args) -> int:
     """Run the app live; its output streams here. Ctrl-C stops it."""
-    src = args.src or DEVICE_APP
+    name = args.app or DEFAULT_APP
+    src, _ = app_paths(name)
     breakin(port)
     print(f"[m5] running {src} on device (Ctrl-C to stop)\n")
     return mp(port, "run", src).returncode
+
+
+def cmd_selftest(port: str, _args) -> int:
+    """Run the on-device end-to-end check (config, wifi, mic, OpenAI)."""
+    breakin(port)
+    print(f"[m5] running {SELFTEST} on device\n")
+    return mp(port, "run", SELFTEST).returncode
 
 
 def cmd_repl(port: str, _args) -> int:
@@ -201,8 +250,12 @@ COMMANDS = {
     "info": cmd_info,
     "ls": cmd_ls,
     "cat": cmd_cat,
+    "apps": cmd_apps,
     "push": cmd_push,
+    "autorun": cmd_autorun,
+    "rm-app": cmd_rm_app,
     "run": cmd_run,
+    "selftest": cmd_selftest,
     "repl": cmd_repl,
     "reset": cmd_reset,
     "logs": cmd_logs,
@@ -220,10 +273,10 @@ def main() -> int:
         p = sub.add_parser(name)
         if name == "cat":
             p.add_argument("path")
-        if name in ("push", "run"):
-            p.add_argument("src", nargs="?")
-        if name == "push":
-            p.add_argument("dest", nargs="?")
+        if name in ("push", "run", "autorun"):
+            p.add_argument("app", nargs="?", help=f"app name (default: {DEFAULT_APP})")
+        if name == "rm-app":
+            p.add_argument("app")
         if name == "logs":
             p.add_argument("-n", "--lines", type=int, default=40)
 
