@@ -84,7 +84,14 @@ wedge and tells you exactly which line hung.
 ## Audio capture: use `M5.Mic`, never `audio.Recorder`
 
 The production app and all ordinary diagnostics use the M5Unified
-`M5.Mic` binding. It owns one persistent I2S task and a two-slot FIFO:
+`M5.Mic` binding. It owns one persistent I2S task and a two-slot FIFO.
+
+The app no longer slices audio on a wall clock. It captures 1 s frames into a
+ring, scores each 100 ms window against the gate, and closes an utterance on
+600 ms of trailing sub-gate audio after at least 400 ms of speech, falling back
+to a `chunk_seconds` ceiling when the talker never pauses.
+`poll_session_controls()` doubles as the audio pump, so the FIFO keeps both
+slots filled during network waits. Facts about the FIFO itself:
 
 - Configure once with
   `M5.Mic.config(sample_rate=16000, magnification=2, task_pinned_core=0)`,
@@ -193,16 +200,25 @@ Measured on this unit, computed from the PCM buffer: quiet room about
 - Passing `font=` to `drawString()` or `textWidth()` **permanently changes the
   current font** as a side effect. Set it back.
 - `M5.Lcd.newCanvas(w, h, bpp, psram)` plus `canvas.push(x, y)` is the
-  vendor-documented flicker fix. `startWrite()`/`endWrite()` batch the SPI
-  transaction but do not buffer. A canvas has neither of those, nor `.FONTS`
-  or `.COLOR`, so pass `M5.Lcd.FONTS.X` into it.
+  vendor-documented flicker fix, and it is verified working on this unit at
+  `bpp=16, psram=True`. A canvas does bind `fillScreen`, `setFont`,
+  `setTextColor`, `drawString` and `textWidth`.
+  `startWrite()`/`endWrite()` batch the SPI transaction but do not buffer. A
+  canvas has neither of those, nor `.FONTS` or `.COLOR`, so pass
+  `M5.Lcd.FONTS.X` into it.
 - Never hold `startWrite()` open across a network call, the SD card shares the
   LCD SPI host.
 - `widgets.Button` is an empty stub that draws nothing. `M5.Widgets` has no
   button, slider or meter. `m5ui` is LVGL and would seize the framebuffer.
   Raw `M5.Lcd` calls are the right choice here.
 - `requests2.post` is synchronous, so the app runs each POST on a short-lived
-  `_thread` worker with a verified 32 KB stack. The main thread continues
+  `_thread` worker. **The stack must be 16 KB, not 32 KB.** A 32 KB task stack
+  cannot be allocated on this board and raises `OSError("can't create thread")`
+  every single time, which silently routed every POST down the blocking
+  fallback and disabled touch during network calls. `thread_probe.py` shows
+  16384/8192/4096/2048 create fine and 32768 never does; `tls_thread_probe.py`
+  completed a real TLS handshake and HTTP round trip on stacks down to 8 KB.
+  Re-probe before raising this value again. The main thread continues
   calling `M5.update()` every 20 ms and latches the initial `wasPressed` event,
   allowing one touch to stop or request settings during either network call.
   Do not move POSTs back onto the UI thread: taps that start and end during a
@@ -212,15 +228,32 @@ Measured on this unit, computed from the PCM buffer: quiet room about
 
 - `requests2` has no `files=`, so the multipart body is hand built and passed
   as `data=<bytearray>`. It is HTTP/1.0 with `Connection: close`, so every
-  request pays a fresh TLS handshake.
+  request pays a fresh TLS handshake. **The app no longer uses it as the
+  primary path.** `KeepAliveClient` holds one HTTP/1.1 TLS socket to
+  api.openai.com open and reuses it for every request in a session, keeping
+  `requests2` as an automatic fallback that latches after three consecutive
+  failures. Verified on this board: raw `socket` + `ssl` works, the handshake
+  costs about 540 ms, and a whole multi-turn session logs exactly one
+  `keep-alive TLS` line.
+- `prewarm()` opens that socket at boot while the idle screen is up. The
+  server may still close it before the first utterance, in which case one
+  extra handshake appears. Reuse within a session is the reliable win.
 - Never use `requests2.post(json=payload)` for non-ASCII JSON. It declares
   `Content-Length` using the Unicode character count but sends UTF-8 bytes,
   causing HTTP 400 or a truncated body for Japanese, curly punctuation, or an
   em dash. Use `data=json.dumps(payload).encode()` and explicitly set
   `Content-Type: application/json`.
-- Measured before optimization: first POST after boot about 33 s. With the
-  current six-second mono chunks, live steady-state transcription took about
-  2-6 s and translation about 2-3 s.
+- Measured on this board with continuous speech and `chunk_seconds = 7`:
+
+  | Stage | Wall-clock chunks + requests2 | Endpointed + keep-alive |
+  |---|---|---|
+  | STT round trip | 2.0-2.9 s | 1.75-1.94 s |
+  | Translation round trip | 2.7-3.4 s | 1.7-2.5 s |
+  | Pipeline total | ~5.2 s | ~3.7 s |
+
+  The wall-clock version also ran an 8.1-8.4 s cycle for a 7 s chunk, so the
+  mic sat idle about 1.2 s of every cycle and roughly 15% of speech was
+  dropped. `mic: queued ... depth=1` right after a requeue is that starvation.
 - `gpt-transcribe` returns `""` on silence and puts the detected language in
   `languages[0].code`. It takes `languages[]` (plural), which replaces
   `language`.
