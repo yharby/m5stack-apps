@@ -812,6 +812,527 @@ def drain_captures():
 
 # ------------------------------------------------------------------ HTTP
 
+# requests2 is HTTP/1.0 and always sends Connection: close, so every call pays
+# a fresh TLS handshake to api.openai.com and every translation turn makes two
+# calls. The first handshake after boot measured about 33 s on this board. The
+# client below holds one TLS socket open and speaks HTTP/1.1 with keep-alive so
+# the second and later requests skip the handshake entirely. It is only ever an
+# optimisation: anything it raises falls through to requests2, see
+# _blocking_post.
+
+KEEPALIVE_DEFAULT_PORT = 443
+# mbedtls copies each write into its own record buffer, so hand it slices
+# rather than one 200 KB fragment.
+KEEPALIVE_WRITE_CHUNK = 1024
+# Drop a socket that has sat unused this long instead of discovering it is dead
+# after uploading 200 KB of audio. Server idle timeouts are typically 60 s.
+KEEPALIVE_MAX_IDLE_MS = 55000
+# A stale keep-alive socket fails almost immediately. A failure later than this
+# is a real timeout or a real server problem, so the request is not replayed.
+KEEPALIVE_REPLAY_WINDOW_MS = 8000
+# Stop paying for the attempt after this many consecutive failures.
+KEEPALIVE_MAX_FAILURES = 3
+# How long a new request waits for a worker abandoned by a cancelled session
+# to finish draining the socket, before giving up and letting requests2 do it.
+KEEPALIVE_BUSY_WAIT_MS = 3000
+
+# Worker stack sizes to try, largest first. Measured on this unit: 32768 is
+# always refused, while 16384, 12288 and 8192 each created a thread that
+# completed a real TLS handshake and round trip to api.openai.com. Blocking on
+# the UI thread is worse than a small stack, so step down before giving up.
+HTTP_THREAD_STACK_STEPS = (HTTP_THREAD_STACK, 12288, 8192)
+
+keepalive_disabled = False
+http_thread_stack = 0
+
+_socket_mod = None
+_ssl_mod = None
+_select_mod = None
+
+
+class ConnectionLost(Exception):
+    """The socket died, which for a reused keep-alive socket is expected."""
+
+
+def _net_modules():
+    """Import the raw network stack lazily so a missing module just falls back."""
+    global _socket_mod, _ssl_mod, _select_mod
+
+    if _socket_mod is None:
+        import socket as socket_mod
+        import ssl as ssl_mod
+
+        try:
+            import select as select_mod
+        except Exception:
+            select_mod = None
+        _socket_mod = socket_mod
+        _ssl_mod = ssl_mod
+        _select_mod = select_mod
+    return _socket_mod, _ssl_mod
+
+
+def _wrap_tls(ssl_mod, raw, host):
+    """Wrap a connected socket, MicroPython builds differ on how.
+
+    server_hostname carries SNI, which api.openai.com needs to serve the right
+    certificate. Neither path verifies the chain, matching what requests2 does.
+    """
+    try:
+        return ssl_mod.wrap_socket(raw, server_hostname=host)
+    except (AttributeError, TypeError):
+        pass
+    ctx = ssl_mod.SSLContext(ssl_mod.PROTOCOL_TLS_CLIENT)
+    try:
+        ctx.verify_mode = ssl_mod.CERT_NONE
+    except Exception:
+        pass
+    return ctx.wrap_socket(raw, server_hostname=host)
+
+
+def split_url(url):
+    """Minimal https URL split, this build has no urllib."""
+    rest = url
+    if rest.startswith("https://"):
+        rest = rest[8:]
+    elif rest.startswith("http://"):
+        raise ValueError("keep-alive client is https only")
+    slash = rest.find("/")
+    if slash < 0:
+        hostport, path = rest, "/"
+    else:
+        hostport, path = rest[:slash], rest[slash:]
+    port = KEEPALIVE_DEFAULT_PORT
+    colon = hostport.find(":")
+    if colon >= 0:
+        port = int(hostport[colon + 1 :])
+        hostport = hostport[:colon]
+    return hostport, port, path
+
+
+def join_exact(parts):
+    """Concatenate into one exactly sized buffer, one copy per part.
+
+    `body += pcm` reallocates and copies the whole upload buffer, which for a
+    six second chunk is about 192 KB and the largest allocation in the app.
+    Slice assignment needs MICROPY_PY_BUILTINS_SLICE_ASSIGN, which this build
+    has, but fall back to concatenation rather than ever failing an upload.
+    """
+    total = 0
+    for part in parts:
+        total += len(part)
+    try:
+        out = bytearray(total)
+        view = memoryview(out)
+        off = 0
+        for part in parts:
+            n = len(part)
+            view[off : off + n] = part
+            off += n
+        return out
+    except Exception as e:
+        log("http: preallocated body build failed %r" % e)
+        out = bytearray()
+        for part in parts:
+            out += part
+        return out
+
+
+class KeepAliveHeaders:
+    """Case-insensitive header map. post_with_retry asks for two spellings."""
+
+    def __init__(self):
+        self.map = {}
+
+    def add(self, name, value):
+        self.map[ascii_lower(name)] = value
+
+    def get(self, name, default=None):
+        return self.map.get(ascii_lower(name), default)
+
+    def __contains__(self, name):
+        return ascii_lower(name) in self.map
+
+
+class KeepAliveResponse:
+    """Drop-in for a requests2 response, as consumed by classify/transcribe."""
+
+    def __init__(self, status_code, headers, body):
+        self.status_code = status_code
+        self.headers = headers
+        self.content = body
+        try:
+            self.text = body.decode()
+        except Exception:
+            # Never let one odd byte take down the caller. classify() only
+            # wants a printable slice and json() can still parse the bytes.
+            self.text = ""
+
+    def json(self):
+        return json.loads(self.text or self.content)
+
+    def close(self):
+        # The body was read to its exact end before this object existed, so
+        # the socket is already clean and stays in the cache.
+        pass
+
+
+class KeepAliveClient:
+    """One persistent HTTP/1.1 TLS connection to the API host.
+
+    Requests in this app are strictly serial, but do_post runs each one on a
+    worker thread and the main thread can abandon it by raising
+    SessionCancelled. The lock keeps a restarted session from touching a socket
+    an abandoned worker is still reading, and invalidate() makes sure a
+    half-read socket is closed rather than reused.
+    """
+
+    def __init__(self):
+        self.lock = _thread.allocate_lock()
+        self.sock = None  # the TLS wrapper that is read and written
+        self.raw = None  # the plain socket underneath, kept for the poll check
+        self.host = None
+        self.port = 0
+        self.addr = None  # cached getaddrinfo entry
+        self.addr_key = None
+        self.idle_since = 0
+        self.discard = False
+        self.failures = 0
+
+    # -- connection ------------------------------------------------------
+
+    def _close(self):
+        sock, raw = self.sock, self.raw
+        self.sock = None
+        self.raw = None
+        for s in (sock, raw):
+            if s is None:
+                continue
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    def invalidate(self):
+        """Mark the cached socket unusable without touching it.
+
+        The main thread calls this when a session is cancelled while a worker
+        may still be mid-response. Closing here would pull the buffer out from
+        under that worker, so the flag is honoured by whichever thread next
+        holds the lock.
+        """
+        self.discard = True
+
+    def _resolve(self, socket_mod, host, port):
+        """Cache getaddrinfo, DNS on this board is a real network round trip."""
+        key = (host, port)
+        if self.addr is not None and self.addr_key == key:
+            return self.addr
+        t0 = time.ticks_ms()
+        try:
+            ai = socket_mod.getaddrinfo(host, port, 0, socket_mod.SOCK_STREAM)[0]
+        except TypeError:
+            ai = socket_mod.getaddrinfo(host, port)[0]
+        self.addr = ai
+        self.addr_key = key
+        log("http: resolved %s in %d ms" % (host, time.ticks_diff(time.ticks_ms(), t0)))
+        return ai
+
+    def _connect(self, host, port):
+        socket_mod, ssl_mod = _net_modules()
+        t0 = time.ticks_ms()
+        ai = self._resolve(socket_mod, host, port)
+        raw = None
+        try:
+            raw = socket_mod.socket(ai[0], ai[1], ai[2])
+            # socket.setdefaulttimeout does not exist on this firmware. The
+            # timeout has to be set on the socket itself, before wrapping,
+            # because the TLS wrapper does not always expose settimeout.
+            raw.settimeout(HTTP_TIMEOUT)
+            raw.connect(ai[-1])
+            sock = _wrap_tls(ssl_mod, raw, host)
+        except Exception:
+            # A cached address that no longer answers is one likely cause.
+            self.addr = None
+            self.addr_key = None
+            if raw is not None:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+            raise
+        self.raw = raw
+        self.sock = sock
+        self.host = host
+        self.port = port
+        self.idle_since = time.ticks_ms()
+        log("http: keep-alive TLS to %s in %d ms" % (host, time.ticks_diff(time.ticks_ms(), t0)))
+
+    def _stale(self):
+        """True if the cached socket should not be trusted with a big upload."""
+        if time.ticks_diff(time.ticks_ms(), self.idle_since) > KEEPALIVE_MAX_IDLE_MS:
+            return True
+        # A server that closed the connection leaves the raw socket readable,
+        # which is a free way to notice before uploading 200 KB of audio. The
+        # body was read to its exact end, so nothing else can be pending.
+        if _select_mod is None or self.raw is None:
+            return False
+        try:
+            poller = _select_mod.poll()
+            poller.register(self.raw, _select_mod.POLLIN)
+            return bool(poller.poll(0))
+        except Exception:
+            return False
+
+    # -- wire ------------------------------------------------------------
+
+    def _send_all(self, data):
+        """Write in slices. memoryview keeps a 200 KB body from being copied."""
+        view = memoryview(data)
+        total = len(view)
+        sent = 0
+        while sent < total:
+            end = sent + KEEPALIVE_WRITE_CHUNK
+            if end > total:
+                end = total
+            n = self.sock.write(view[sent:end])
+            if not n:
+                # A blocking socket should never report "would block" (None).
+                raise ConnectionLost("write returned %r" % n)
+            sent += n
+
+    def _readline(self):
+        try:
+            line = self.sock.readline()
+        except AttributeError:
+            line = self._readline_bytewise()
+        if not line:
+            raise ConnectionLost("server closed the connection")
+        return line
+
+    def _readline_bytewise(self):
+        """Fallback for a TLS socket without the stream readline binding."""
+        out = bytearray()
+        while True:
+            ch = self.sock.read(1)
+            if not ch:
+                break
+            out += ch
+            if ch == b"\n":
+                break
+        return bytes(out)
+
+    def _read_exactly(self, n):
+        """Read exactly n bytes. read() is free to return fewer at any time."""
+        buf = bytearray(n)
+        view = memoryview(buf)
+        got = 0
+        while got < n:
+            chunk = self.sock.read(n - got)
+            if not chunk:
+                raise ConnectionLost("body truncated at %d of %d" % (got, n))
+            view[got : got + len(chunk)] = chunk
+            got += len(chunk)
+        return buf
+
+    def _read_to_eof(self):
+        out = bytearray()
+        while True:
+            chunk = self.sock.read(512)
+            if not chunk:
+                break
+            out += chunk
+        return out
+
+    def _read_head(self):
+        """Parse the status line and headers, and decide if the socket lives."""
+        line = self._readline()
+        parts = line.split()
+        if not line.startswith(b"HTTP/") or len(parts) < 2:
+            raise ConnectionLost("bad status line %r" % line[:40])
+        status = int(parts[1].decode())
+        headers = KeepAliveHeaders()
+        while True:
+            line = self._readline().strip()
+            if not line:
+                break
+            colon = line.find(b":")
+            if colon < 0:
+                continue
+            headers.add(line[:colon].decode().strip(), line[colon + 1 :].decode().strip())
+        conn = ascii_lower(headers.get("connection") or "")
+        close_after = "close" in conn
+        if parts[0] == b"HTTP/1.0" and "keep-alive" not in conn:
+            close_after = True
+        return status, headers, close_after
+
+    def _read_body(self, status, headers):
+        """Return (payload, must_close). Exact framing is what makes reuse safe."""
+        if status in (204, 304):
+            return b"", False
+        if "chunked" in ascii_lower(headers.get("transfer-encoding") or ""):
+            return self._read_chunked(), False
+        length = headers.get("content-length")
+        if length is not None:
+            try:
+                n = int(length.strip())
+            except Exception:
+                raise ConnectionLost("bad content-length %r" % length)
+            return self._read_exactly(n), False
+        # No framing at all means the body ends at EOF, so this socket cannot
+        # be reused whatever the headers claimed.
+        return self._read_to_eof(), True
+
+    def _read_chunked(self):
+        out = bytearray()
+        while True:
+            line = self._readline().strip()
+            if not line:
+                # Tolerate a stray blank line between chunks.
+                continue
+            semi = line.find(b";")
+            if semi >= 0:
+                line = line[:semi]
+            size = int(line.decode(), 16)
+            if size == 0:
+                break
+            out += self._read_exactly(size)
+            self._read_exactly(2)  # the CRLF that terminates every chunk
+        # Trailers, then the blank line that ends the message.
+        while self._readline().strip():
+            pass
+        return out
+
+    # -- requests --------------------------------------------------------
+
+    def _build_head(self, method, host, port, path, body, headers):
+        length = len(body) if body else 0
+        host_header = host if port == KEEPALIVE_DEFAULT_PORT else "%s:%d" % (host, port)
+        lines = [
+            "%s %s HTTP/1.1" % (method, path),
+            "Host: " + host_header,
+            "Connection: keep-alive",
+            "Accept: application/json",
+            # This build has no decompressor and the framing has to stay exact.
+            "Accept-Encoding: identity",
+            "Content-Length: %d" % length,
+        ]
+        if headers:
+            for name in headers:
+                lines.append("%s: %s" % (name, headers[name]))
+        return ("\r\n".join(lines) + "\r\n\r\n").encode()
+
+    def _acquire(self):
+        """Bounded wait, a MicroPython lock has no timeout argument.
+
+        A worker abandoned by a cancelled session can still be draining the
+        socket. Waiting behind it is correct, waiting forever is not, so give
+        up after a few seconds and let the caller fall back to requests2.
+        """
+        deadline = time.ticks_add(time.ticks_ms(), KEEPALIVE_BUSY_WAIT_MS)
+        while not self.lock.acquire(False):
+            if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
+                raise ConnectionLost("keep-alive client still busy")
+            time.sleep_ms(20)
+
+    def post(self, url, body, headers):
+        host, port, path = split_url(url)
+        self._acquire()
+        try:
+            return self._request_locked("POST", host, port, path, body, headers)
+        finally:
+            self.lock.release()
+
+    def prewarm_url(self, url):
+        """Open the connection now. Returns True if a handshake actually ran."""
+        host, port, _ = split_url(url)
+        self._acquire()
+        try:
+            self._drop_if_discarded()
+            if (
+                self.sock is not None
+                and host == self.host
+                and port == self.port
+                and not self._stale()
+            ):
+                return False
+            self._close()
+            self._connect(host, port)
+            return True
+        finally:
+            self.lock.release()
+
+    def _drop_if_discarded(self):
+        if self.discard:
+            # A cancelled session may have abandoned a half-read socket.
+            if self.sock is not None:
+                log("http: dropping keep-alive socket left by a cancelled session")
+            self._close()
+            self.discard = False
+
+    def _request_locked(self, method, host, port, path, body, headers):
+        self._drop_if_discarded()
+        if self.sock is not None and (host != self.host or port != self.port):
+            self._close()
+        head = self._build_head(method, host, port, path, body, headers)
+        for attempt in (0, 1):
+            if self.sock is not None and self._stale():
+                self._close()
+            reused = self.sock is not None
+            t0 = time.ticks_ms()
+            try:
+                if self.sock is None:
+                    self._connect(host, port)
+                    t0 = time.ticks_ms()
+                self._send_all(head)
+                if body:
+                    self._send_all(body)
+                status, resp_headers, close_after = self._read_head()
+            except Exception as e:
+                self._close()
+                quick = time.ticks_diff(time.ticks_ms(), t0) < KEEPALIVE_REPLAY_WINDOW_MS
+                if attempt == 0 and reused and quick:
+                    # Servers close idle keep-alive sockets routinely and this
+                    # is the normal way to find out. Reconnect and replay: the
+                    # request never reached the server, so nothing is repeated.
+                    log("http: keep-alive socket was stale (%r), replaying" % e)
+                    continue
+                raise
+            try:
+                payload, must_close = self._read_body(status, resp_headers)
+            except Exception:
+                # A half-read socket is never reusable.
+                self._close()
+                raise
+            if close_after or must_close:
+                self._close()
+            else:
+                self.idle_since = time.ticks_ms()
+            return KeepAliveResponse(status, resp_headers, payload)
+        raise ConnectionLost("keep-alive replay exhausted")
+
+
+HTTP_CLIENT = KeepAliveClient()
+
+
+def prewarm():
+    """Open the TLS session before the first utterance has to wait for it.
+
+    The first handshake after boot measured about 33 s on this board. This is
+    purely an optimisation, so every failure here is logged and swallowed.
+    """
+    if keepalive_disabled:
+        return False
+    t0 = time.ticks_ms()
+    try:
+        opened = HTTP_CLIENT.prewarm_url(CFG["transcribe_url"])
+    except Exception as e:
+        log("http: prewarm failed %r" % e)
+        return False
+    if opened:
+        log("http: prewarmed in %d ms" % time.ticks_diff(time.ticks_ms(), t0))
+    return True
+
 
 class ApiError(Exception):
     def __init__(self, status, body, retryable):
@@ -848,12 +1369,43 @@ def poll_session_controls():
     return True
 
 
-def _blocking_post(url, kw):
+def _requests2_post(url, kw):
     """requests2 accepts an undocumented timeout=, fall back if it ever stops."""
     try:
         return requests2.post(url, timeout=HTTP_TIMEOUT, **kw)
     except TypeError:
         return requests2.post(url, **kw)
+
+
+def _keepalive_usable(kw):
+    """The client only speaks the two kwargs this app actually posts with."""
+    if kw.get("data") is None:
+        return False
+    return all(name in ("data", "headers") for name in kw)
+
+
+def _blocking_post(url, kw):
+    """One POST, keep-alive first, requests2 as the guaranteed fallback.
+
+    The keep-alive client is an optimisation and never a dependency. A missing
+    ssl module, a handshake failure, an unparseable response, a second
+    consecutive dead socket: all of it lands here and is re-sent over
+    requests2, which pays a fresh TLS handshake but always works.
+    """
+    global keepalive_disabled
+
+    if not keepalive_disabled and _keepalive_usable(kw):
+        try:
+            r = HTTP_CLIENT.post(url, kw.get("data"), kw.get("headers"))
+            HTTP_CLIENT.failures = 0
+            return r
+        except Exception as e:
+            HTTP_CLIENT.failures += 1
+            log("http: keep-alive POST failed (%d) %r" % (HTTP_CLIENT.failures, e))
+            if HTTP_CLIENT.failures >= KEEPALIVE_MAX_FAILURES:
+                keepalive_disabled = True
+                log("http: keep-alive disabled for this run, using requests2 only")
+    return _requests2_post(url, kw)
 
 
 def _post_worker(result, url, kw):
@@ -867,24 +1419,48 @@ def _post_worker(result, url, kw):
         result[0] = -1
 
 
+def _start_post_worker(result, url, kw):
+    """Start the POST worker, stepping the stack down until one is accepted.
+
+    A 32 KB stack is rejected outright on this board, which quietly sent every
+    single POST down the blocking path. Retry once at each size before dropping
+    to the next, because the ESP32 port can also transiently reject a task
+    while old resources are still settling.
+    """
+    global http_thread_stack
+
+    for size in HTTP_THREAD_STACK_STEPS:
+        if http_thread_stack and size > http_thread_stack:
+            continue  # already known to be more than this board will allocate
+        for attempt in (0, 1):
+            try:
+                _thread.stack_size(size)
+            except Exception:
+                pass
+            try:
+                _thread.start_new_thread(_post_worker, (result, url, kw))
+            except Exception as e:
+                log("http: worker start failed at %d bytes %r" % (size, e))
+                gc.collect()
+                if attempt == 0:
+                    time.sleep_ms(50)
+                continue
+            if size != http_thread_stack:
+                log("http: POST worker stack is now %d bytes" % size)
+                http_thread_stack = size
+            return True
+    return False
+
+
 def do_post(url, **kw):
     """POST without starving display/touch updates on the main thread."""
     result = [0, None]
-    try:
-        _thread.start_new_thread(_post_worker, (result, url, kw))
-    except Exception as e:
-        # The ESP32 port can transiently reject a task while old resources are
-        # settling. Collect and retry once before sacrificing UI polling.
-        log("http: worker start retry after %r" % e)
-        gc.collect()
-        time.sleep_ms(50)
-        try:
-            _thread.start_new_thread(_post_worker, (result, url, kw))
-        except Exception as retry_error:
-            # Preserve network functionality if task allocation is genuinely
-            # unavailable, though this one fallback call cannot service touch.
-            log("http: worker unavailable %r; using blocking POST" % retry_error)
-            return _blocking_post(url, kw)
+    if not _start_post_worker(result, url, kw):
+        # Genuine last resort. This blocks the main thread for the whole round
+        # trip, so touch is dead and poll_session_controls stops running, which
+        # also stalls the capture pump. Make that visible rather than silent.
+        log("http: NO worker thread available, blocking POST, touch and capture stall")
+        return _blocking_post(url, kw)
 
     while result[0] == 0:
         poll_session_controls()
@@ -896,6 +1472,9 @@ def do_post(url, **kw):
                 result[1].close()
             except Exception:
                 pass
+        # The abandoned worker may still be reading the shared keep-alive
+        # socket. Flag it so a half-read socket is dropped, never reused.
+        HTTP_CLIENT.invalidate()
         raise SessionCancelled()
     if result[0] < 0:
         raise result[1]
@@ -987,20 +1566,22 @@ def transcribe(pcm):
     for keyword in keywords:
         if keyword:
             fields.append(("keywords[]", str(keyword)))
-    body = bytearray()
+    head = bytearray()
     for name, value in fields:
-        body += (
+        head += (
             "--" + BOUNDARY + "\r\n"
             'Content-Disposition: form-data; name="' + name + '"\r\n\r\n' + value + "\r\n"
         ).encode()
-    body += (
+    head += (
         "--" + BOUNDARY + "\r\n"
         'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
         "Content-Type: audio/wav\r\n\r\n"
     ).encode()
-    body += wav_header(len(pcm))
-    body += pcm
-    body += ("\r\n--" + BOUNDARY + "--\r\n").encode()
+    head += wav_header(len(pcm))
+    # The preamble is small, so it can grow. The PCM is not: appending it to a
+    # bytearray reallocates and copies the whole ~192 KB body, so the parts are
+    # measured first and copied once into an exactly sized buffer.
+    body = join_exact((head, pcm, ("\r\n--" + BOUNDARY + "--\r\n").encode()))
 
     log("stt: POST %d bytes to %s" % (len(body), CFG["transcribe_model"]))
     r = post_with_retry(
