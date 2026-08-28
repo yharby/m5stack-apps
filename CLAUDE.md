@@ -81,56 +81,44 @@ Because a wedge costs a manual reset, on-device test scripts should write
 their progress to a file under `/flash` as they go. That file survives the
 wedge and tells you exactly which line hung.
 
-## Audio, `audio.Recorder`
+## Audio capture: use `M5.Mic`, never `audio.Recorder`
 
-Constructor is `Recorder(sample, bits, stereo)`. `create_pcm_buf`, `record`,
-`record_into`, `rms`, `volume`, `config`, `pause`, `resume`, `stop`,
-`is_running`, `is_recording` and the format constants `PCM=1 AMR=2 WAV=4
-MP3=5` are the whole API.
+The production app and all ordinary diagnostics use the M5Unified
+`M5.Mic` binding. It owns one persistent I2S task and a two-slot FIFO:
 
-- **`record_into(buf, sync)` takes ONLY those two arguments.** Passing
-  `sample=`, `bits=` or `stereo=` raises
-  `TypeError: extra keyword arguments given`. Format comes from the
-  constructor or from `config()`.
-- **Always pass a buffer from `recorder.create_pcm_buf(seconds)`.** Passing a
-  plain `bytearray` of the same size crashed the board hard, twice. Every
-  capture that has ever worked on this unit used `create_pcm_buf`.
-- `create_pcm_buf(seconds)` takes whole seconds and multiplies by the current
-  channel count, so 5 s at 16 kHz mono is 160000 bytes and stereo is 320000.
-  The docs omit the channel factor and are wrong.
-- **`record_into(buf, sync=False)` returns in about 60 ms and fills the buffer
-  from a background task.** Verified: 163451 Python loop iterations ran during
-  a 2 s capture, and a 10 s buffer filled completely with real audio while the
-  interpreter was blocked in a 33 s TLS upload. The consumer task is pinned to
-  core 0, the I2S and resample elements to core 1. This is what makes the
-  pipeline in `translator.py` possible, and it needs no `_thread`.
-- **There is no way to ask how many bytes have been captured.** The progress
-  counter is a stack local in the C task and is never written back.
-  `is_recording()` is literally `pipeline != NULL`.
-- **`is_recording()` cannot be used as a completion signal.** It was still
-  `True` 23 s after a 10 s buffer had finished filling. Time the capture
-  instead, the ADF task runs at exactly the sample rate.
-- **Never call `recorder.stop()`.** Its spin wait (`while state !=
-  AEL_STATE_FINISHED`) has no timeout. Calling it after an async capture hung
-  the board permanently. Let the capture run itself out instead.
-- **`rms()` and `volume()` are destructive and misleading.** Both tear down
-  the capture pipeline, rebuild it hard coded at 8000 Hz / 16 bit / stereo,
-  read 1024 fresh bytes (64 ms of the room *now*), and tear it down again.
-  Measured 13 dB apart from the truth on this unit: `rms()` said -45.7 dBFS
-  for a clip whose real level, computed from the PCM, was -32.1 dBFS. Compute
-  levels from the buffer, which is what `channel_dbfs()` does.
-- **Every `audio.Recorder(...)` leaks a 4 KB FreeRTOS task that is never
-  freed.** Build exactly one per boot. Repeatedly `mpremote run`-ing a script
-  that constructs a Recorder, without rebooting in between, is a slow path to
-  a wedge.
-- `config(sample, bits, stereo)` only writes struct fields, which take effect
-  on the next pipeline build. It fills defaults for anything omitted, so
-  **always pass all three**, otherwise `config(sample=16000)` silently resets
-  bits and stereo.
-- `record(uri, time, sync)` writing to a file hung the board for 240 s and
-  never returned. Avoid it, use `record_into`.
-- `socket.setdefaulttimeout` does not exist. `requests2.post` accepts an
-  undocumented `timeout=`.
+- Configure once with
+  `M5.Mic.config(sample_rate=16000, magnification=2, task_pinned_core=0)`,
+  then call `M5.Mic.begin()`. MicroPython runs on the other core.
+- `M5.Mic.record(buf, 16000, stereo)` queues a writable `bytearray` and
+  returns immediately. A plain `bytearray` is correct; `create_pcm_buf` also
+  returns one and provides no special safety.
+- `M5.Mic.isRecording()` is the FIFO occupancy: 0, 1, or 2. The app keeps two
+  mono buffers queued so recording continues while Python is blocked in TLS.
+- The C++ queue stores raw pointers, not Python references. Every queued
+  buffer must remain strongly rooted until its slot completes. The app keeps
+  both in the global `capture_buffers` list and uploads a copy before
+  requeueing the original.
+- At 16 kHz, signed 16-bit mono needs 32000 bytes per second. Stereo is twice
+  that. Arbitrary buffer lengths work, including 150 ms stereo meter frames.
+- `M5.Mic.end()` waits for an in-flight buffer instead of cancelling it. A
+  real five-second test called `end()` after 350 ms and it returned after the
+  remaining 4.65 s. Stop a session by ceasing requeues and draining the FIFO.
+- Six repeated three-second FIFO captures, followed by teardown and restart,
+  completed on this unit. The full translator also ran repeated six-second
+  captures during both OpenAI calls with 0-1 ms requeue time.
+- `M5.Mic` and `audio.Recorder` both claim CoreS3 I2S port 1. They must never
+  coexist in the same process.
+
+`audio.Recorder` is retained only in `async_settle.py` as a regression probe.
+Its first `record_into(..., sync=False)` works and genuinely overlaps TLS, but
+the second capture enters an ADF cleanup spin wait with no timeout. In the
+decisive test, cycle 0 settled after 3219 ms; cycle 1 was still recording after
+15 seconds. `stop()` and file recording have also wedged the board. Do not use
+this API in the app or general tests. Its `rms()`/`volume()` methods are also
+destructive and measured about 13 dB below the PCM's true level.
+
+`socket.setdefaulttimeout` does not exist. `requests2.post` accepts an
+undocumented `timeout=`.
 
 ## Microphones and gain
 
@@ -147,11 +135,11 @@ bytes on the wire. Stereo is only useful for metering the two mics separately.
 
 Sensitivity levers, in order of preference:
 
-1. **Analog.** `board_init.c` sets the ES7210 PGA to 30 dB (code 10). The
-   ladder tops out at 37.5 dB (code 14), so there is **7.5 dB free**. Poke
+1. **Analog.** `M5.Mic.begin()` initializes the ES7210 PGA to code 11. The
+   ladder tops out at 37.5 dB (code 14). Poke
    registers `0x43` and `0x44`, preserving bit 4 which is the PGA enable.
-   `board_codec_init` is guarded and runs once per boot, so the write should
-   persist. Off by default in the app (`analog_gain_code: 0`) until verified.
+   Apply the poke after `M5.Mic.begin()`, which rewrites the codec registers.
+   It remains off by default (`analog_gain_code: 0`) until verified.
 2. **Digital.** A saturating in-place gain with `@micropython.viper` over
    `ptr16`. Viper `ptr16` loads are unsigned so samples must be sign extended
    by hand, and the result must be clamped, never allowed to wrap. Speech
@@ -185,6 +173,17 @@ Measured on this unit, computed from the PCM buffer: quiet room about
 - Japanese needs `M5.Lcd.setFont(M5.Lcd.FONTS.AlibabaSansJA24)`, otherwise
   glyphs do not render. `M5.Lcd.textWidth()` exists, so wrap by real
   measurement rather than guessing character widths.
+- Do not choose the font from the transcription API's language metadata. It
+  returned `en` for several clearly Japanese kana/kanji transcripts during a
+  live run. `detect_source()` inspects the actual characters, and the drawing
+  code independently does the same before choosing the glyph set.
+- Normalize smart quotes, dashes, ellipses, and non-breaking spaces to ASCII
+  for LCD display. Some Latin font builds omit those glyphs. This changes only
+  the rendered copy, not the logged or translated text.
+- Avoid `str.lower()` over arbitrary transcripts on this MicroPython build. A
+  real Japanese response containing an uncommon Unicode code point raised
+  `UnicodeError`. `ascii_lower()` folds only A-Z for the English hallucination
+  blocklist and leaves all other characters untouched.
 - Fonts present on CoreS3: Montserrat 12/14/16/18/24/40/44/48 and the three
   Alibaba CJK 24 faces. **Montserrat 20, 22, 30 and 36 do not exist** and
   raise `AttributeError`. `ASCII7` and the `DejaVu*` names are aliases onto
@@ -210,11 +209,26 @@ Measured on this unit, computed from the PCM buffer: quiet room about
 - `requests2` has no `files=`, so the multipart body is hand built and passed
   as `data=<bytearray>`. It is HTTP/1.0 with `Connection: close`, so every
   request pays a fresh TLS handshake.
-- Measured: first POST after boot about 33 s (one-off TLS and cert setup),
-  steady state about 11 s for a 160 KB upload, translate 3.5 to 7 s.
+- Never use `requests2.post(json=payload)` for non-ASCII JSON. It declares
+  `Content-Length` using the Unicode character count but sends UTF-8 bytes,
+  causing HTTP 400 or a truncated body for Japanese, curly punctuation, or an
+  em dash. Use `data=json.dumps(payload).encode()` and explicitly set
+  `Content-Type: application/json`.
+- Measured before optimization: first POST after boot about 33 s. With the
+  current six-second mono chunks, live steady-state transcription took about
+  2-6 s and translation about 2-3 s.
 - `gpt-transcribe` returns `""` on silence and puts the detected language in
   `languages[0].code`. It takes `languages[]` (plural), which replaces
   `language`.
+- `gpt-transcribe` supports a `keywords` array for domain words and phrases.
+  The app sends repeated `keywords[]` multipart fields containing canonical
+  open-geospatial terms. Keep recognition keywords short and factual; do not
+  put translation policy or self-correction rules into transcription.
+- Translation uses a compact open-geospatial system instruction. It preserves
+  canonical Latin spellings, applies consistent Japanese STAC terms, and
+  resolves explicit spoken self-corrections by omitting only the superseded
+  words. It deliberately does not contain command-execution rules: this app
+  translates speech, it does not execute it.
 - `whisper-1` hallucinates confidently on silence. A silent 5 s clip from this
   device returned `ご視聴ありがとうございました。` and `"Thank you for
   watching!"`. That is why it is not used, and why the app still keeps a

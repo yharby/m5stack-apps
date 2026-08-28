@@ -233,7 +233,7 @@ def cmd_probe(port: str, _args) -> int:
     breakin(port)
     return remote_exec(
         port,
-        "import struct, math, json, network\n"
+        "import struct, math, json, network, time\n"
         "print('--- config ---')\n"
         "cfg = None\n"
         "for p in ('/flash/config.json','/flash/res/config.json'):\n"
@@ -252,10 +252,13 @@ def cmd_probe(port: str, _args) -> int:
         "M5.Lcd.setFont(M5.Lcd.FONTS.AlibabaSansJA24)\n"
         "print('JA font width test:', M5.Lcd.textWidth('\\u3053\\u3093\\u306b\\u3061\\u306f'))\n"
         "print('--- mic ---')\n"
-        "from audio import Recorder\n"
-        "r = Recorder(16000, 16, False)\n"
-        "b = r.create_pcm_buf(1)\n"
-        "r.record_into(b, sync=True)\n"
+        "M5.Mic.end()\n"
+        "M5.Mic.config(sample_rate=16000, magnification=2, task_pinned_core=0)\n"
+        "if not M5.Mic.begin(): raise RuntimeError('M5.Mic.begin failed')\n"
+        "b = bytearray(32000)\n"
+        "if not M5.Mic.record(b, 16000, False): raise RuntimeError('M5.Mic.record failed')\n"
+        "while M5.Mic.isRecording(): time.sleep_ms(20)\n"
+        "M5.Mic.end()\n"
         "n = len(b)//2; acc = 0\n"
         "for i in range(0, n, 7):\n"
         "    v = struct.unpack_from('<h', b, i*2)[0]; acc += v*v\n"

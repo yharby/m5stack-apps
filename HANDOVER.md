@@ -1,260 +1,118 @@
 # Handover, M5Stack CoreS3 translator
 
-Written mid-task. Read `CLAUDE.md` first, especially its **FACTS** section,
-which already records everything verified about this board. This file covers
-only what is *in flight*, what we are stuck on, and what was tried.
+Updated 2026-08-28 after the blocker was resolved and tested on the real
+device. Read `CLAUDE.md` first; its FACTS section is the durable reference.
 
----
+## Current status: working
 
-## 1. Where the project stands
+The translator now records continuously enough for practical use, transcribes
+and translates in both directions, and keeps the LCD responsive between
+network calls. The user tested the six-second UI and said it was working very
+well.
 
-Working and verified end to end on real hardware, in both directions:
-record, transcribe with `gpt-transcribe`, translate with `gpt-5.6-luna`,
-render EN and JA on the LCD.
+The production design is `M5.Mic`, not `audio.Recorder`:
 
-Repo state at handover: 7 commits, `make check` passes (ruff format + lint on
-`device/` and `tools/`). Latest commit is
-`84e49bd Overlap capture with network I/O, add a touch settings panel`.
+- One persistent M5Unified mic task is pinned to core 0.
+- Two mono `bytearray` buffers are kept in the mic's FIFO.
+- When the oldest buffer finishes, the app copies it, immediately requeues
+  the original, then transcribes and translates the stable copy.
+- Capture therefore continues while MicroPython is blocked in TLS.
+- On stop, the app ceases requeues and drains both raw buffer pointers before
+  allowing the Python objects to be freed.
 
-**The committed `device/apps/translator.py` has NOT been run on the device
-yet.** It was written against conclusions that the last experiment partly
-overturned. See section 4. Do not push it as-is without reading section 5.
+Live end-to-end results with two 192000-byte buffers (six seconds each):
 
-## 2. What the user asked for, in their words
+- Requeue took 0-1 ms.
+- Viper 4x gain took about 35 ms for 96000 samples.
+- Steady transcription took roughly 2-6 s.
+- Translation generally took 2-3 s.
+- Repeated English-to-Japanese chunks, silence gating, and Japanese speech
+  were all exercised without an audio restart hang.
 
-1. `"we need to optmise it more as it's so slow taking the advantage of 2
-   cores of esp32-s3 .. so one can still lestining and caching the wav and the
-   other core handling the sending to openai and reciving back?"`
-   The old loop recorded 5 s, then went deaf for the entire ~15 s OpenAI round
-   trip. They want capture and network overlapped.
-2. `"make the mic so sensitive for now .. maybe we can have small settings icon
-   that you can have the input metere of 2 mics visualisation and 2 arrows to
-   modify the buffer/sensitivity?"`
-3. Reread all scripts and bring them up to date with every finding.
-4. Put all findings in `CLAUDE.md` under a FACTS section. **Done.**
-5. Use subagents in parallel. **Done, two ran, results folded into CLAUDE.md.**
+## Important fix made after the first successful run
 
-## 3. What is done
+`gpt-transcribe` repeatedly returned language `en` for transcripts containing
+obvious Japanese kana and kanji. Trusting that metadata selected the wrong
+translation direction and made the LCD render Japanese with a Latin font,
+which appeared as boxes.
 
-- `CLAUDE.md` rewritten with a FACTS section covering audio, mics and gain,
-  display and touch, HTTP and OpenAI, and how to recover a wedged board.
-- `device/apps/translator.py` rewritten (~1030 lines): pipelined capture,
-  buffer-derived levels, settings page with two mic meters and three
-  steppers, viper digital gain, `timeout=` on both posts, mono uploads,
-  WAV header inlined into the multipart body.
-- `tools/m5.py`: added `run-file <path>` for one-off device probes, and
-  `breakin()` now exits with "the board is wedged, hard reset it" instead of a
-  pyserial traceback.
-- `pyproject.toml`: `B905` added to the device per-file-ignores, MicroPython's
-  `zip()` has no `strict=`.
+`recognize()` now determines EN versus JA from the returned text itself. The
+display independently inspects the text before selecting its glyph font, so a
+bad API language label cannot produce boxes again. A second live run verified
+Japanese speech was logged as `[ja, api='en']` and translated into English.
 
-## 4. WHERE WE ARE STUCK
+## Why `audio.Recorder` was abandoned
 
-**You cannot start a second asynchronous capture. It hangs the board.**
+The original ADF experiment proved that one asynchronous capture could fill a
+buffer during a blocking 33-second TLS request. But restarting it is unsafe:
 
-`record_into(buf, sync=False)` works beautifully once. It returns in 3 to 60 ms
-and an ADF task fills the buffer on the other core while the interpreter is
-blocked in TLS. That part is proven (see 5.2). The problem is the *second*
-call.
+- cycle 0 returned in 57 ms and `is_recording()` became false after 3219 ms;
+- cycle 1 returned in 3 ms but never settled within 15 seconds;
+- the next restart or `stop()` enters an untimed firmware spin wait and wedges
+  the board until a physical hard reset.
 
-Mechanism, from `m5stack/cmodules/adf_module/audio_recorder.c` at tag `2.5.1`:
+Plain `bytearray` was never the problem: `create_pcm_buf()` returns the same
+type. The decisive scripts are kept in `tools/device_scripts/async_settle.py`,
+`m5_mic_queue.py`, and `m5_mic_cancel.py`.
 
-- `record_into` line 557: `if (self->pipeline != NULL) audio_recorder_stop_helper(self);`
-- `stop_helper` lines 611 to 635 contains
-  `while (state != AEL_STATE_FINISHED) vTaskDelay(100ms);` **with no timeout**.
-- After an async capture, `is_recording()` (which is just `pipeline != NULL`)
-  was still `True` 23 s after a 10 s buffer had completely filled.
+## M5.Mic evidence
 
-So the pipeline does not reach `FINISHED` promptly, `stop_helper` spins
-forever, and the board is gone. Ctrl-C cannot reach it because it is inside a
-C call. Only a physical hard reset recovers it (no EN line on native USB CDC,
-DTR/RTS and esptool both do nothing).
+The replacement was verified against UIFlow2 2.5.1 and M5Unified source, then
+on the physical CoreS3:
 
-**This blocks the user's request 1 as currently designed.** The committed
-`run_session()` does exactly the thing that hangs.
+- `M5.Mic.record(buf, 16000, False)` queues asynchronously.
+- `isRecording()` is queue occupancy 0/1/2.
+- Six consecutive three-second captures completed, followed by `end()`,
+  `begin()`, and another successful capture.
+- Calling `end()` 350 ms into a five-second capture waited the remaining
+  4.65 s; it does not cancel an active buffer. The app drains instead.
+- Mono mixes the two physical ES7210 mic channels. Stereo is used only for
+  the channel probe and the responsive 150 ms settings meters.
+- `M5.Mic` and `audio.Recorder` both own I2S1 and must not coexist.
 
-### The open question, and the exact next experiment
+## UI and HTTP changes
 
-One earlier run *did* restart cleanly, so this may be a settling-time issue
-rather than a permanent one:
+- Default chunk duration is six seconds for quicker page changes and shorter
+  sentences.
+- The HEARD preview is compact; TRANSLATION gets most of the screen.
+- English text chooses among several font sizes using measured wrapping.
+- Japanese uses `AlibabaSansJA24`; font choice is based on the actual text.
+- Common smart punctuation is normalized only for LCD rendering so a missing
+  Latin glyph cannot appear as an isolated box.
+- The hallucination filter uses ASCII-only case folding. MicroPython's full
+  `str.lower()` raised `UnicodeError` on one real Japanese transcript.
+- The previous translation remains visible until its replacement is ready.
+- The top status shows an approximate listening countdown.
+- Settings use 150 ms stereo frames, giving responsive independent mic bars.
+- Chat JSON is explicitly UTF-8 encoded before POST. `requests2`'s `json=`
+  path uses character count for Content-Length and broke Japanese/em-dash
+  payloads with HTTP 400.
+- `gpt-transcribe` receives a concise `keywords[]` glossary for canonical
+  FOSS4G/OSGeo terminology. The translation prompt preserves canonical names,
+  uses consistent STAC nouns, and resolves explicit spoken self-corrections.
+  Device verification returned HTTP 200, recognized `OSGeo JP` in Japanese
+  speech, and translated a Japanese test sentence while preserving `FOSS4G`,
+  `STAC`, and `GeoParquet`. The full glossary adds about 3.8 KB to a 192 KB
+  six-second upload and did not measurably change the roughly two-second
+  steady translation time.
 
-| Run | Buffer | Gap before the next `record_into`/`stop()` | Result |
-|---|---|---|---|
-| `async_test.py` | 2 s | several seconds (a Python scan of the buffer ran in between) | `stop()` succeeded, script completed |
-| `buf_test.py` D→E | 5 s | 400 ms | **restart hung** |
-| `overlap2.py` | 10 s | 23 s, but WiFi/TLS had run concurrently | `stop()` hung |
+## Final verification
 
-Hypothesis: the pipeline needs a grace period after the buffer fills before it
-reaches `AEL_STATE_FINISHED`, and 400 ms is not enough.
+- Ruff formatting, lint, and `git diff --check` pass.
+- The finalized app was pushed to `/flash/apps/translator.py`.
+- A live Japanese run produced multiple correctly directed English results.
+- The same run produced curly U+2019 punctuation such as `today’s`; the
+  LCD-only normalizer deterministically renders it as ASCII `today's`, which
+  is present in the Latin font.
+- `make probe` and `make selftest` are updated to use `M5.Mic`. The selftest
+  deliberately sends Japanese JSON to cover the UTF-8 Content-Length bug.
 
-The script to settle this is already written at
-`<scratchpad>/settle_test.py` (path in section 7). It polls `is_recording()`
-every 100 ms for up to 20 s after the fill point, logs the exact millisecond it
-flips to `False`, and only then attempts a restart, repeating four times.
-Run it with:
+If USB remains present but every command hangs inside a C call, ask the user
+to hard reset: hold power about six seconds, then press once. Native USB CDC
+has no EN line for the host to toggle.
 
-```bash
-uv run python tools/m5.py run-file <scratchpad>/settle_test.py
-```
+## Security
 
-Read `/flash/settle.log` afterwards, it survives a wedge.
-
-- If `is_recording()` reliably flips to `False`, **use that as the restart
-  gate** and the pipeline works as designed. Change `capture_done()` in
-  `translator.py` back to polling `is_recording()`, and keep a hard timeout so
-  a stuck pipeline degrades instead of hanging.
-- If it never flips, the async path is a **one-shot per boot** and the
-  pipelined design must be abandoned. See section 6 for fallbacks.
-
-## 5. Everything we tried, with evidence
-
-### 5.1 Async capture returns immediately, CONFIRMED
-```
-recorder attrs: ['stop','AMR','MP3','PCM','WAV','config','create_pcm_buf',
-                 'is_recording','is_running','pause','record','record_into',
-                 'resume','rms','volume']
-buf len 64000
-record_into(sync=False) returned after 57 ms
-python loop iterations during record: 163451
-nonzero samples sampled: 123 of 125
-DONE
-```
-
-### 5.2 Capture genuinely overlaps a blocking TLS upload, CONFIRMED
-From `/flash/overlap.log`. A 10 s buffer was started, then a 33 s POST ran on
-the main thread. Every offset in the buffer holds real audio:
-```
-async capture started, is_recording True
-POST took 33176 ms -> {"text":"Outside your main domain is one of the ways
-                       entrenchment.","languages":[{"code":"en"}],...}
-elapsed since capture start 33236 ms  is_recording True
-  off 0      (t=0s) level -49.5
-  off 64000  (t=2s) level -38.2
-  off 128000 (t=4s) level -45.6
-  off 192000 (t=6s) level -47.5
-  off 256000 (t=8s) level -40.3
-  off 288000 (t=9s) level -50.1
-```
-The script then called `r.stop()` and **never printed its final line**. That is
-the hang.
-
-### 5.3 `rms()` is destructive and reads 13 dB low, CONFIRMED live
-```
-clip level from buffer: -32.108324 dBFS   recorder.rms(): -45.732976
-```
-Same clip, two methods. `rms()` tears the pipeline down, rebuilds it at
-8 kHz/16/stereo, and reads 1024 fresh bytes, i.e. 64 ms of the room *now*.
-**This was the real cause of "the mic is not sensitive".** The gate was
-comparing against a number that was 13 dB too low.
-
-### 5.4 Buffer type is NOT the problem, my earlier conclusion was wrong
-From `/flash/buf.log`:
-```
---- A: create_pcm_buf(1), sync=True ---
-  type <class 'bytearray'> len 32000
-  A ok
---- B: bytearray(32000), sync=True ---
-  B ok
---- C: bytearray(4800) short, sync=True ---
-  C ok
---- D: create_pcm_buf(5), sync=False ---
-  D returned in 3 ms
-  D done, is_recording True
---- E: restart into a second create_pcm_buf(5), sync=False ---
-                                     <-- hung here, nothing further
-```
-`create_pcm_buf` returns a plain `bytearray`, and a hand-rolled `bytearray`
-works fine, including a short 4800-byte one for fast meter updates. An earlier
-crash on a plain bytearray (`cycle_test.py`) was almost certainly the restart
-hazard, not the buffer.
-
-**`translator.py` currently forces `create_pcm_buf` everywhere on the strength
-of that wrong conclusion. It is harmless but the 1 fps settings meter it
-causes is not. Once E is understood, switch the meter frame back to
-`bytearray(int(SAMPLE_RATE * 0.15) * 2 * channels)` for ~5 fps.**
-
-### 5.5 Things that hang or crash the board, all learned the hard way
-- `r.record("file:///flash/t.mp3", 3)` hung for 240 s and never returned.
-- `r.stop()` after an async capture, hung.
-- `record_into(sync=False)` while a previous async capture has not settled, hung.
-- Repeatedly `mpremote run`-ing a script that constructs an `audio.Recorder`
-  without rebooting. Each constructor **leaks a 4 KB FreeRTOS task forever**.
-  Build one per boot.
-
-### 5.6 Two subagent research passes, both source-verified
-Against `uiflow_micropython` tag `2.5.1` (commit `96c8a6e2`), M5Unified,
-M5GFX, and the official CoreS3 schematic. Full findings are already merged
-into `CLAUDE.md`. Headlines:
-- Two **real** MEMS mics, U12 on ES7210 ch1 and U13 on ch2. Ch3 is an echo
-  reference off the speaker, ch4 is grounded. `stereo=False` **mixes** both
-  mics, it does not pick one.
-- ES7210 PGA sits at 30 dB, ladder tops out at 37.5 dB. **7.5 dB is free** via
-  I2C regs `0x43`/`0x44` at address `0x40` on port 1 (SCL 11, SDA 12),
-  preserving bit 4. Untested on device, gated behind `analog_gain_code: 0`.
-- `M5.Touch` has **no** `wasClicked()` method, it is `getDetail(0)[6]`.
-  Hold is `[9]`. `M5.update()` must run every loop.
-- Colours are 24-bit `0xRRGGBB`, there is **no** `color565()`.
-- `Montserrat20/22/30/36` do not exist on CoreS3.
-- `widgets.Button` is an empty stub that draws nothing.
-
-## 6. Fallbacks if the restart really is impossible
-
-In rough order of value:
-
-1. **One long capture, consumed progressively.** Start a single
-   `record_into(big, sync=False)` with, say, a 60 s buffer (1.92 MB, there is
-   ~8 MB free). The ADF fills it sequentially and the buffer is ours, so read
-   completed regions out of it *while it is still filling*, using elapsed time
-   to know how far it has got (32000 bytes/s mono, minus a safety margin).
-   Upload slices as they become available. This gives genuinely continuous
-   capture with zero restarts. The session simply ends when the buffer is
-   full, or the app reboots itself. **This is the most promising route.**
-2. **`pause()` / `resume()`.** They exist and manipulate the same event group
-   without going through `stop_helper`. Whether they let you retarget a buffer
-   is unknown and worth 10 minutes of probing.
-3. **Switch to `M5.Mic` instead of `audio.Recorder`.** It is bound and
-   supported on CoreS3, exposes `config(magnification=N)` for real digital
-   gain, and `isRecording()` returns a queue depth (0/1/2) which is closer to a
-   progress signal. The catch is that `M5.Mic` and `audio.Recorder` both claim
-   I2S port 1 and cannot coexist, so this is an all-or-nothing rewrite of the
-   audio layer.
-4. **Give up on overlap, shrink the round trip instead.** `requests2` is
-   HTTP/1.0 with `Connection: close`, so every call pays a fresh TLS
-   handshake. Measured: first POST after boot ~33 s, steady state ~11 s for
-   160 KB, translate 3.5 to 7 s. Trimming silence before upload and using mono
-   (already done, halves the bytes) are the cheap wins.
-
-## 7. Operational notes for whoever picks this up
-
-- **Scratchpad with all the probe scripts:**
-  `/private/tmp/claude-501/-Users-yharby-Documents-gh-m5stack-translator/a746350a-5ff0-4a2c-b629-f3e0678766c7/scratchpad/`
-  Contains `async_test.py`, `overlap_test.py`, `overlap2.py`, `cycle_test.py`,
-  `buf_test.py`, `settle_test.py` (the next one to run), and `devrun.py`.
-  `tools/m5.py run-file <path>` now does what `devrun.py` did, prefer it.
-- **Always have on-device scripts append progress to a file under `/flash`.**
-  Every finding above came from a log that survived a wedge. Serial output does
-  not survive.
-- **Budget for hard resets.** Ask the user to hold the power button ~6 s, then
-  press once. There is no software path. The user has been doing this
-  willingly, they said "ask me to hard reset it for you if you want that".
-- Never run two things at the port at once, and kill stray `mpremote`
-  processes before retrying.
-- Between risky probes, get the user to reset, so a leaked Recorder task from
-  the previous run cannot confound the next.
-
-## 8. Outstanding, unrelated to the blocker
-
-- **The user's OpenAI API key was pasted in plaintext in the first message of
-  the original conversation and still needs rotating.** It has been reminded
-  once and should be reminded again. Never echo it. `.gitignore` blocks
-  `config.json` everywhere and the real config lives only on the device at
-  `/flash/res/config.json`.
-- The ES7210 +7.5 dB PGA poke is written but disabled (`analog_gain_code: 0`).
-  Verify it on device, then default it to `14`.
-- The viper `_gain_inplace` has never executed on the board. Confirm it
-  compiles under this MicroPython build and time it over 160000 samples.
-- `set_channels()` uses `recorder.config(...)` to switch mono/stereo at
-  runtime. Never exercised. Remember `config()` fills defaults for omitted
-  arguments, so all three must always be passed.
-- Delete the probe logs left on the device: `/flash/overlap.log`,
-  `/flash/buf.log`, `/flash/cycle.log`, `/flash/settle.log`.
+The OpenAI API key pasted in the original conversation must be rotated. Never
+echo it. The real config stays only at `/flash/res/config.json`, and
+`.gitignore` blocks `config.json`.

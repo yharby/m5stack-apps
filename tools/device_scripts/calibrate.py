@@ -4,15 +4,22 @@ Stay quiet for the first few windows, then talk normally at arm's length.
 """
 
 import struct
+import time
 
-from audio import Recorder
+import M5
 
-rec = Recorder(16000, 16, False)
-buf = rec.create_pcm_buf(1)
+M5.begin()
+M5.Mic.end()
+M5.Mic.config(sample_rate=16000, magnification=2, task_pinned_core=0)
+if not M5.Mic.begin():
+    raise SystemExit("M5.Mic.begin failed")
+buf = bytearray(32000)
 
 print("window  rms   peak  bar")
 for i in range(12):
-    rec.record_into(buf, sync=True)
+    M5.Mic.record(buf, 16000, False)
+    while M5.Mic.isRecording():
+        time.sleep_ms(20)
     n = len(buf) // 2
     acc = 0
     peak = 0
@@ -27,4 +34,5 @@ for i in range(12):
     rms = int((acc / cnt) ** 0.5)
     bar = "#" * min(50, rms // 40)
     print("%4d  %6d %6d  %s" % (i, rms, peak, bar))
+M5.Mic.end()
 print("DONE")

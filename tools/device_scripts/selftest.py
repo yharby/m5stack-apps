@@ -1,4 +1,4 @@
-"""On-device end-to-end self test: config -> wifi -> mic -> Whisper -> GPT.
+"""On-device end-to-end self test: config -> Wi-Fi -> chat -> mic -> STT.
 
 Run with:  make selftest      (uses mpremote run, output streams to the host)
 Verifies the real network path with the real key; prints no secrets.
@@ -11,7 +11,6 @@ import time
 import M5
 import network
 import requests2
-from audio import Recorder
 
 SAMPLE_RATE = 16000
 SECONDS = 5
@@ -44,23 +43,33 @@ print("wifi: connected:", w.isconnected(), w.ifconfig()[0] if w.isconnected() el
 
 # ---- 1. chat completions (cheapest check of key + TLS + JSON) --------------
 print("\n[1/3] chat completions ...")
+chat_model = CFG.get("chat_model", "gpt-5.6-luna")
+chat_payload = {
+    "model": chat_model,
+    "messages": [
+        {
+            "role": "system",
+            "content": (
+                "Translate Japanese to English for a FOSS4G/OSGeo audience. "
+                "Preserve FOSS4G, STAC, and GeoParquet exactly. Output only translation."
+            ),
+        },
+        # Non-ASCII is intentional: it verifies that requests2 receives an
+        # explicit UTF-8 byte body and therefore sends a correct Content-Length.
+        {"role": "user", "content": "FOSS4GでSTACとGeoParquetについて話します。"},
+    ],
+    "max_completion_tokens": 200,
+}
+if chat_model.startswith("gpt-5"):
+    chat_payload["reasoning_effort"] = "none"
 r = requests2.post(
     CFG.get("chat_url", "https://api.openai.com/v1/chat/completions"),
-    json={
-        "model": CFG.get("chat_model", "gpt-4o-mini"),
-        "temperature": 0,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Translate the user's English text into Japanese. "
-                    "Reply with only the translation."
-                ),
-            },
-            {"role": "user", "content": "Where is the train station?"},
-        ],
+    data=json.dumps(chat_payload).encode(),
+    headers={
+        "Authorization": "Bearer " + key,
+        "Content-Type": "application/json",
     },
-    headers={"Authorization": "Bearer " + key},
+    timeout=45,
 )
 print("     status:", r.status_code)
 if r.status_code == 200:
@@ -69,11 +78,17 @@ else:
     print("     body:", r.text[:300])
 
 # ---- 2. microphone ---------------------------------------------------------
-print("\n[2/3] recording", SECONDS, "s - SAY SOMETHING IN ENGLISH NOW ...")
+print("\n[2/3] recording", SECONDS, "s - SAY SOMETHING IN ENGLISH OR JAPANESE NOW ...")
 M5.begin()
-rec = Recorder(SAMPLE_RATE, 16, False)
-pcm = rec.create_pcm_buf(SECONDS)
-rec.record_into(pcm, sync=True)
+M5.Mic.end()
+M5.Mic.config(sample_rate=SAMPLE_RATE, magnification=2, task_pinned_core=0)
+if not M5.Mic.begin():
+    raise SystemExit("M5.Mic.begin failed")
+pcm = bytearray(SAMPLE_RATE * SECONDS * 2)
+M5.Mic.record(pcm, SAMPLE_RATE, False)
+while M5.Mic.isRecording():
+    time.sleep_ms(20)
+M5.Mic.end()
 n = len(pcm) // 2
 acc = 0
 cnt = 0
@@ -84,8 +99,8 @@ for i in range(0, n, 11):
 rms = int((acc / cnt) ** 0.5)
 print("     captured", len(pcm), "bytes, rms =", rms)
 
-# ---- 3. whisper multipart upload ------------------------------------------
-print("\n[3/3] whisper transcription ...")
+# ---- 3. transcription multipart upload -----------------------------------
+print("\n[3/3] transcription ...")
 header = struct.pack(
     "<4sI4s4sIHHIIHH4sI",
     b"RIFF",
@@ -105,16 +120,27 @@ header = struct.pack(
 wav = bytearray(header)
 wav += pcm
 
-pre = (
-    "--" + BOUNDARY + "\r\n"
-    'Content-Disposition: form-data; name="model"\r\n\r\n'
-    + CFG.get("whisper_model", "whisper-1")
-    + "\r\n"
+body = bytearray()
+for name, value in (
+    ("model", CFG.get("transcribe_model", "gpt-transcribe")),
+    ("response_format", "json"),
+    ("languages[]", "en"),
+    ("languages[]", "ja"),
+    ("keywords[]", "FOSS4G"),
+    ("keywords[]", "OSGeo"),
+    ("keywords[]", "STAC"),
+    ("keywords[]", "GeoParquet"),
+    ("keywords[]", "MapLibre"),
+):
+    body += (
+        "--" + BOUNDARY + "\r\n"
+        'Content-Disposition: form-data; name="' + name + '"\r\n\r\n' + value + "\r\n"
+    ).encode()
+body += (
     "--" + BOUNDARY + "\r\n"
     'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
     "Content-Type: audio/wav\r\n\r\n"
 ).encode()
-body = bytearray(pre)
 body += wav
 body += ("\r\n--" + BOUNDARY + "--\r\n").encode()
 
@@ -126,6 +152,7 @@ r = requests2.post(
         "Authorization": "Bearer " + key,
         "Content-Type": "multipart/form-data; boundary=" + BOUNDARY,
     },
+    timeout=45,
 )
 print("     status:", r.status_code)
 print("     result:", r.text[:300])

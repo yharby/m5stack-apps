@@ -9,15 +9,14 @@ Device API facts, all verified by probing this board or by reading the
 uiflow-micropython 2.5.1 source. Do not "fix" these back to what the docs
 suggest, see the FACTS section of CLAUDE.md for the full list.
 
-  * Recorder.record_into(buf, sync) takes ONLY those two arguments. The audio
-    format comes from the Recorder(sample, bits, stereo) constructor.
-  * record_into(buf, sync=False) returns in about 60 ms and the ADF task
-    fills the buffer in the background, so capture overlaps Python work.
-    That is what the pipeline below exploits.
-  * Recorder.rms() and volume() are DESTRUCTIVE. They tear down the capture
-    pipeline and rebuild it at 8000/16/stereo to read 1024 fresh bytes, so
-    they measure the room now, not the clip you just recorded. Measured 13 dB
-    off on this unit. Levels here are computed from the PCM buffer instead.
+  * audio.Recorder's second asynchronous capture wedges in its untimed ADF
+    cleanup loop. This app does not construct one. M5.Mic owns one persistent
+    I2S task and a two-buffer FIFO that has completed repeated real-device
+    capture, teardown, and restart tests.
+  * M5.Mic.record(buf, 16000, stereo) is asynchronous. isRecording() returns
+    queue occupancy: 0 idle, 1 one slot active, 2 both slots occupied.
+  * M5.Mic keeps only a raw pointer to each buffer, so queued buffers remain
+    globally rooted until their captures finish.
   * M5.Touch exposes only getX/getY/getCount/getDetail/getTouchPointRaw.
     There is no wasClicked() method, it is getDetail(0)[6].
   * M5.update() must run every loop or touch state never changes.
@@ -57,6 +56,48 @@ CONFIG_PATHS = (
     "/flash/apps/config.json",
 )
 
+DEFAULT_DOMAIN_KEYWORDS = (
+    "FOSS4G",
+    "OSGeo",
+    "STAC",
+    "SpatioTemporal Asset Catalog",
+    "OGC",
+    "OGC API",
+    "Cloud Native Geospatial",
+    "COG",
+    "Cloud Optimized GeoTIFF",
+    "GeoParquet",
+    "Apache Parquet",
+    "GeoServer",
+    "MapServer",
+    "GeoJSON",
+    "GeoTIFF",
+    "Zarr",
+    "GeoZarr",
+    "MapLibre",
+    "MapLibre GL JS",
+    "GDAL",
+    "PROJ",
+    "PostGIS",
+    "QGIS",
+    "GeoPackage",
+    "FlatGeobuf",
+    "PMTiles",
+    "GeoArrow",
+    "DuckDB",
+    "Apache Sedona",
+    "COPC",
+    "vector tiles",
+    "raster tiles",
+    "coordinate reference system",
+    "CRS",
+    "EPSG",
+    "WMS",
+    "WFS",
+    "WCS",
+    "WMTS",
+)
+
 CFG = {
     "wifi_ssid": "",
     "wifi_pass": "",
@@ -65,21 +106,26 @@ CFG = {
     "chat_url": "https://api.openai.com/v1/chat/completions",
     "transcribe_model": "gpt-transcribe",
     "chat_model": "gpt-5.6-luna",
+    # gpt-transcribe supports a keywords array specifically for domain terms.
+    # This can be replaced by a JSON array in the device config.
+    "domain_keywords": DEFAULT_DOMAIN_KEYWORDS,
+    "domain_context": (
+        "a live FOSS4G/OSGeo conversation about open geospatial standards, "
+        "software, data formats, and cloud-native geospatial architecture"
+    ),
     # Sensitivity. Measured from the PCM buffer, which reads about 13 dB
     # higher than the broken recorder.rms(). Quiet room is about -55 dBFS on
     # this unit and speech peaks about -32 dBFS, so -52 is deliberately hot.
     "gate_dbfs": -52,
-    # Seconds of audio per API call. The mic stays open for exactly this
-    # long while the previous chunk is being uploaded, so setting it near the
-    # round trip time (about 15 s) means almost no dead air.
-    "chunk_seconds": 10,
-    # Capture two ES7210 channels so the settings page can meter both.
-    "stereo": True,
+    # Seconds of audio per API call. Two buffers remain queued while the
+    # previous chunk is uploaded. Six seconds feels responsive and generally
+    # gives the network enough audio runway without producing long sentences.
+    "chunk_seconds": 6,
     # Digital gain applied to the PCM before upload, 1 to 16. Speech peaks at
     # about -32 dBFS on this unit so there is roughly 30 dB of headroom.
     "mic_gain": 4,
-    # ES7210 PGA code, 10 is the 30 dB the firmware sets, 14 is the 37.5 dB
-    # maximum. Off by default until the I2C poke is verified on this unit.
+    # ES7210 PGA code. M5.Mic initializes code 11 and the maximum is 14.
+    # Off by default until the I2C poke is verified on this unit.
     "analog_gain_code": 0,
 }
 
@@ -125,16 +171,20 @@ GEAR_BOX = (288, 1, 32, 30)
 
 BOUNDARY = "----M5CoreS3TranslatorBoundary"
 
-recorder = None
-channels = 1
 running = False
 fatal = ""
 last_orig = ""
 last_trans = ""
+last_src = "en"
+last_trans_lang = "ja"
 last_level = -99.0
-capture_started = 0
 font_ja = None
 font_ui = None
+font_label = None
+font_source_en = None
+font_trans_en = None
+capture_buffers = None
+settings_requested = False
 
 
 # ------------------------------------------------------------------ logging
@@ -177,14 +227,14 @@ def load_config():
     else:
         log("config: NONE of %s found" % (CONFIG_PATHS,))
     log(
-        "config: api_key=%s stt=%s chat=%s gate=%s chunk=%ss stereo=%s"
+        "config: api_key=%s stt=%s chat=%s gate=%s chunk=%ss gain=%sx"
         % (
             "yes" if CFG["openai_api_key"] else "NO",
             CFG["transcribe_model"],
             CFG["chat_model"],
             CFG["gate_dbfs"],
             CFG["chunk_seconds"],
-            CFG["stereo"],
+            CFG["mic_gain"],
         )
     )
 
@@ -334,6 +384,8 @@ def draw_gear(color=FG_DIM):
 def set_status(text, color=FG_STATUS):
     try:
         M5.Lcd.fillRect(0, 0, GEAR_BOX[0] - 2, 30, BG)
+        if font_ui is not None:
+            M5.Lcd.setFont(font_ui)
         M5.Lcd.setTextColor(color, BG)
         M5.Lcd.drawString(text, 6, 3)
     except Exception:
@@ -343,7 +395,7 @@ def set_status(text, color=FG_STATUS):
 def draw_frame():
     M5.Lcd.fillScreen(BG)
     M5.Lcd.drawLine(0, 31, W - 1, 31, FG_LINE)
-    M5.Lcd.drawLine(0, 132, W - 1, 132, FG_LINE)
+    M5.Lcd.drawLine(0, 104, W - 1, 104, FG_LINE)
     draw_gear()
 
 
@@ -371,22 +423,92 @@ def wrap_text(text, max_px=W - 12):
     return lines
 
 
-def draw_region(y_top, height, text, color):
-    M5.Lcd.fillRect(0, y_top, W, height, BG)
-    if not text:
-        M5.Lcd.setTextColor(FG_DIM, BG)
-        M5.Lcd.drawString("...", 6, y_top + 4)
-        return
-    M5.Lcd.setTextColor(color, BG)
-    y = y_top + 4
-    for ln in wrap_text(text)[: height // 26]:
-        M5.Lcd.drawString(ln, 6, y)
-        y += 26
+def lcd_safe_text(text):
+    """Replace common smart punctuation missing from some Latin font builds."""
+    for old, new in (
+        ("\u2018", "'"),
+        ("\u2019", "'"),
+        ("\u201c", '"'),
+        ("\u201d", '"'),
+        ("\u2013", "-"),
+        ("\u2014", "-"),
+        ("\u2026", "..."),
+        ("\u00a0", " "),
+    ):
+        text = text.replace(old, new)
+    return text
+
+
+def fit_lines(text, candidates, max_px, available):
+    """Choose the largest available font whose wrapped text fits."""
+    chosen_font, chosen_height, chosen_lines = candidates[-1][0], candidates[-1][1], []
+    for font, line_height in candidates:
+        if font is not None:
+            M5.Lcd.setFont(font)
+        lines = wrap_text(text, max_px)
+        chosen_font, chosen_height, chosen_lines = font, line_height, lines
+        if len(lines) * line_height <= available:
+            break
+    return chosen_font, chosen_height, chosen_lines
+
+
+def draw_labeled_region(label_y, text_y, bottom, label, text, color, language, primary):
+    M5.Lcd.fillRect(0, label_y, W, bottom - label_y, BG)
+    if font_label is not None:
+        M5.Lcd.setFont(font_label)
+    M5.Lcd.setTextColor(FG_DIM, BG)
+    M5.Lcd.drawString(label, 7, label_y)
+
+    available = bottom - text_y
+    # Select the glyph set from the text itself. The transcription API has
+    # returned language="en" for clearly Japanese text on this device; using
+    # that metadata for rendering produces tofu boxes.
+    text_language = detect_source(text) if text else language
+    shown_text = lcd_safe_text(text)
+    if text_language == "ja":
+        candidates = ((font_ja, 26),)
+    elif primary:
+        candidates = (
+            (font_trans_en, 28),
+            (font_source_en, 22),
+            (font_ui, 19),
+            (font_label, 15),
+        )
+    else:
+        candidates = ((font_source_en, 22), (font_ui, 19), (font_label, 15))
+    font, line_height, lines = fit_lines(shown_text or "...", candidates, W - 14, available)
+    if font is not None:
+        M5.Lcd.setFont(font)
+    M5.Lcd.setTextColor(color if text else FG_DIM, BG)
+    y = text_y
+    visible = available // line_height
+    for line in lines[:visible]:
+        M5.Lcd.drawString(line, 7, y)
+        y += line_height
 
 
 def update_display():
-    draw_region(36, 94, last_orig, FG_ORIG)
-    draw_region(137, 100, last_trans, FG_TRANS)
+    target = last_trans_lang if last_trans else ("ja" if last_src == "en" else "en")
+    draw_labeled_region(
+        35,
+        50,
+        103,
+        "HEARD  %s" % last_src.upper(),
+        last_orig,
+        FG_ORIG,
+        last_src,
+        False,
+    )
+    draw_labeled_region(
+        108,
+        124,
+        239,
+        "TRANSLATION  %s" % target.upper(),
+        last_trans,
+        FG_TRANS,
+        target,
+        True,
+    )
 
 
 # ------------------------------------------------------------------ settings
@@ -453,7 +575,6 @@ def settings_page():
     """Live meters for both ES7210 mics, plus the three tunables."""
     global last_level
 
-    set_channels(2 if CFG["stereo"] else 1)
     if font_ui is not None:
         M5.Lcd.setFont(font_ui)
     M5.Lcd.fillScreen(BG)
@@ -480,10 +601,10 @@ def settings_page():
     M5.Lcd.setTextColor(FG_TEXT, FG_PANEL)
     M5.Lcd.drawString("Back", BACK_BOX[0] + 34, BACK_BOX[1] + 7)
 
-    # create_pcm_buf takes whole seconds and record_into fills the whole
-    # buffer, so the meters refresh about once a second. Each call also builds
-    # and tears down a pipeline, which costs another 100 ms or so.
-    frame = recorder.create_pcm_buf(1)
+    # M5.Mic's persistent task accepts arbitrary buffer lengths. A 150 ms
+    # stereo frame gives responsive independent meters for the two real mics.
+    meter_frames = int(SAMPLE_RATE * 0.15)
+    frame = bytearray(meter_frames * 2 * 2)
     dirty = False
     repeat_at = 0
 
@@ -521,9 +642,12 @@ def settings_page():
                 break
 
         try:
-            recorder.record_into(frame, sync=True)
-            d1 = channel_dbfs(frame, 0, channels)
-            d2 = channel_dbfs(frame, channels - 1, channels)
+            if not M5.Mic.record(frame, SAMPLE_RATE, True):
+                raise RuntimeError("mic queue failed")
+            while M5.Mic.isRecording():
+                time.sleep_ms(10)
+            d1 = channel_dbfs(frame, 0, 2)
+            d2 = channel_dbfs(frame, 1, 2)
         except Exception:
             d1 = d2 = -99.0
         last_level = d1
@@ -543,7 +667,8 @@ def settings_page():
 
 
 def wav_header(n):
-    byte_rate = SAMPLE_RATE * 2 * channels
+    channels = 1
+    byte_rate = SAMPLE_RATE * 2
     return struct.pack(
         "<4sI4s4sIHHIIHH4sI",
         b"RIFF",
@@ -604,8 +729,8 @@ def apply_gain(buf):
 def boost_analog_gain(code):
     """Raise the ES7210 PGA above the 30 dB the firmware sets.
 
-    board_codec_init runs once per boot and is guarded, so this write survives
-    later record_into calls. Codes are 0..14 for 0..37.5 dB.
+    M5.Mic keeps the codec active between queued buffers. Codes are 0..14 for
+    0..37.5 dB; configure_mic reapplies this after every Mic.begin().
     """
     if not code:
         return
@@ -621,49 +746,46 @@ def boost_analog_gain(code):
         log("es7210: PGA poke failed %r" % e)
 
 
-def set_channels(n):
-    """Switch mono/stereo at runtime.
-
-    config() only writes struct fields, they take effect on the next pipeline
-    build. It also fills defaults for anything omitted, so all three arguments
-    are always passed. Uploads run mono because that halves the bytes on the
-    wire and the firmware mixes both mics into it. Stereo is only used to meter
-    the two mics separately on the settings page.
-    """
-    global channels
-    if channels == n:
-        return
-    try:
-        recorder.config(sample=SAMPLE_RATE, bits=16, stereo=(n == 2))
-        channels = n
-        log("recorder: switched to %d ch" % n)
-    except Exception as e:
-        log("recorder: config(%d ch) failed %r" % (n, e))
-
-
-def start_capture(buf):
-    """Kick off a background capture. Returns in about 60 ms.
-
-    The ADF consumer task runs on core 0 and the I2S and resample elements on
-    core 1, so the board keeps listening while the interpreter is blocked in a
-    TLS upload. That is the whole point of the pipeline below.
-    """
-    global capture_started
-    recorder.record_into(buf, sync=False)
-    capture_started = time.ticks_ms()
+def configure_mic():
+    """Start the persistent M5.Mic task once, pinned away from MicroPython."""
+    M5.Mic.end()
+    M5.Mic.config(
+        sample_rate=SAMPLE_RATE,
+        magnification=2,
+        task_pinned_core=0,
+    )
+    if not M5.Mic.begin():
+        raise RuntimeError("M5.Mic.begin failed")
+    # M5.Mic.begin's codec callback rewrites the ES7210 registers, so an
+    # optional analog PGA override must come afterwards.
+    boost_analog_gain(CFG["analog_gain_code"])
+    log(
+        "mic: running=%s rate=%s stereo_in=%s core=%s"
+        % (
+            M5.Mic.isRunning(),
+            M5.Mic.config("sample_rate"),
+            M5.Mic.config("stereo"),
+            M5.Mic.config("task_pinned_core"),
+        )
+    )
 
 
-def capture_done():
-    """True once the capture window has elapsed.
+def queue_capture(buf):
+    """Append one mono buffer to M5.Mic's two-slot FIFO."""
+    t0 = time.ticks_ms()
+    if not M5.Mic.record(buf, SAMPLE_RATE, False):
+        raise RuntimeError("M5.Mic.record failed")
+    log(
+        "mic: queued %d bytes in %d ms depth=%d"
+        % (len(buf), time.ticks_diff(time.ticks_ms(), t0), M5.Mic.isRecording())
+    )
 
-    This is deliberately time based. is_recording() is only pipeline != NULL
-    and was observed still True 23 s after a 10 s buffer had filled, so it
-    cannot be used as a completion signal. The ADF task captures at exactly the
-    sample rate, so elapsed time is the reliable one. Never call stop(): its
-    spin wait has no timeout and hangs the board for good.
-    """
-    window = CFG["chunk_seconds"] * 1000 + 400
-    return time.ticks_diff(time.ticks_ms(), capture_started) >= window
+
+def drain_captures():
+    """Let queued raw pointers finish before their Python buffers are freed."""
+    while M5.Mic.isRecording():
+        M5.update()
+        time.sleep_ms(20)
 
 
 # ------------------------------------------------------------------ HTTP
@@ -671,10 +793,12 @@ def capture_done():
 
 class ApiError(Exception):
     def __init__(self, status, body, retryable):
-        Exception.__init__(self, "HTTP %d" % status)
         self.status = status
         self.body = body
         self.retryable = retryable
+
+    def __str__(self):
+        return "HTTP %d" % self.status
 
 
 def do_post(url, **kw):
@@ -747,14 +871,23 @@ def transcribe(pcm):
     The WAV header goes straight into the body rather than building a separate
     WAV first, which avoids a second full sized copy of the audio.
     """
-    fields = (
+    fields = [
         ("model", CFG["transcribe_model"]),
         ("response_format", "json"),
         # gpt-transcribe takes languages[] (plural) and replaces `language`.
         # Constraining it to the two languages we care about improves accuracy.
         ("languages[]", "en"),
         ("languages[]", "ja"),
-    )
+    ]
+    # The official gpt-transcribe `keywords` field guides recognition of
+    # uncommon words and phrases. Repeated keywords[] form fields encode the
+    # array in the same way as languages[].
+    keywords = CFG.get("domain_keywords") or DEFAULT_DOMAIN_KEYWORDS
+    if not isinstance(keywords, (list, tuple)):
+        keywords = DEFAULT_DOMAIN_KEYWORDS
+    for keyword in keywords:
+        if keyword:
+            fields.append(("keywords[]", str(keyword)))
     body = bytearray()
     for name, value in fields:
         body += (
@@ -799,24 +932,51 @@ def detect_source(text):
     return "ja" if (kana or (kanji and kanji > latin)) else "en"
 
 
+def ascii_lower(text):
+    """Lowercase ASCII without MicroPython's Unicode case-mapping table.
+
+    `str.lower()` raised UnicodeError on a real Japanese transcript containing
+    an uncommon code point. The hallucination blocklist only needs English
+    A-Z folding, so leave every other character unchanged.
+    """
+    chars = []
+    for ch in text:
+        code = ord(ch)
+        chars.append(chr(code + 32) if 0x41 <= code <= 0x5A else ch)
+    return "".join(chars)
+
+
 def looks_hallucinated(text):
-    t = text.strip().lower().rstrip(".!?。！？")
+    t = ascii_lower(text.strip())
+    while t and t[-1] in ".!?。！？":
+        t = t[:-1]
     if not t:
         return True
-    return any(h.lower() in t for h in HALLUCINATIONS)
+    return any(ascii_lower(h) in t for h in HALLUCINATIONS)
 
 
 def translate(text, src):
     src_name, tgt_name = ("Japanese", "English") if src == "ja" else ("English", "Japanese")
+    keywords = CFG.get("domain_keywords") or DEFAULT_DOMAIN_KEYWORDS
+    if not isinstance(keywords, (list, tuple)):
+        keywords = DEFAULT_DOMAIN_KEYWORDS
+    glossary = ", ".join(str(term) for term in keywords)
     payload = {
         "model": CFG["chat_model"],
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "You are a precise translator. Translate the user's %s "
-                    "text into %s. Reply with only the translation, no "
-                    "explanation and no quotes." % (src_name, tgt_name)
+                    "Live EN-JA interpreter for %s. Translate %s to %s. Use "
+                    "canonical spellings: %s. Keep project names, standards, "
+                    "formats, APIs, and acronyms in Latin script. In Japanese "
+                    "STAC context use アセット/カタログ/コレクション/アイテム "
+                    "for asset/catalog/collection/item. Resolve explicit "
+                    "self-corrections (no, wait, actually, scratch that, "
+                    "いや, じゃなくて, やっぱり, 訂正) by keeping the corrected "
+                    "intent and omitting only superseded words; preserve "
+                    "independent clauses. Output only the natural translation."
+                    % (CFG["domain_context"], src_name, tgt_name, glossary)
                 ),
             },
             {"role": "user", "content": text},
@@ -828,9 +988,18 @@ def translate(text, src):
         # tokens and latency on a one-line translation.
         payload["reasoning_effort"] = "none"
 
+    # requests2 serializes json= to a Unicode str and uses its character count
+    # as Content-Length even though the socket writes UTF-8 bytes. An em dash
+    # or Japanese text therefore truncates the declared request body. Encode
+    # explicitly so Content-Length is the actual byte count.
+    body = json.dumps(payload).encode()
     r = post_with_retry(
         "tt",
-        lambda: do_post(CFG["chat_url"], json=payload, headers=auth_headers()),
+        lambda: do_post(
+            CFG["chat_url"],
+            data=body,
+            headers=auth_headers({"Content-Type": "application/json"}),
+        ),
     )
     return r.json()["choices"][0]["message"]["content"]
 
@@ -838,13 +1007,10 @@ def translate(text, src):
 # ------------------------------------------------------------------ pipeline
 
 
-def wait_for_capture():
-    """Hold until the background capture has filled its buffer.
-
-    This is the only window where a tap can land while the app is running, so
-    the UI is serviced here.
-    """
-    global running
+def wait_for_front_buffer(estimated_done):
+    """Wait until the oldest of two queued M5.Mic buffers is complete."""
+    global running, settings_requested
+    shown = -1
     while True:
         M5.update()
         if BtnPWR.wasClicked():
@@ -852,34 +1018,49 @@ def wait_for_capture():
         pos = tap()
         if pos:
             if hit(pos[0], pos[1], GEAR_BOX):
-                settings_page()
-                set_status("Listening and sending...")
+                settings_requested = True
+                running = False
+                set_status("Opening settings after capture...", FG_DIM)
             else:
                 running = False
-                set_status("Stopping after this chunk...", FG_DIM)
-        if capture_done() or not running:
+                set_status("Stopping after queued audio...", FG_DIM)
+        if M5.Mic.isRecording() < 2 or not running:
             return
+        remaining_ms = time.ticks_diff(estimated_done, time.ticks_ms())
+        remaining = max(0, (remaining_ms + 999) // 1000)
+        if remaining != shown:
+            shown = remaining
+            set_status("Listening  ~%d s" % remaining)
         time.sleep_ms(20)
 
 
-def handle(pcm):
-    """Transcribe and translate one captured chunk. The mic is already open."""
-    global last_orig, last_trans, last_level
+def prepare_chunk(pcm):
+    """Gate, gain, and freeze a completed buffer so it can be requeued."""
+    global last_level
 
-    level = channel_dbfs(pcm, 0, channels)
-    peak = channel_peak_dbfs(pcm, 0, channels)
+    level = channel_dbfs(pcm)
+    peak = channel_peak_dbfs(pcm)
     last_level = level
-    secs = len(pcm) / (SAMPLE_RATE * 2.0 * channels)
+    secs = len(pcm) / (SAMPLE_RATE * 2.0)
     log("rec: %d bytes %.1fs rms=%.1f peak=%.1f dBFS" % (len(pcm), secs, level, peak))
 
     # Gate on RMS or on a clear transient, so a single short word still passes.
     if level < CFG["gate_dbfs"] and peak < CFG["gate_dbfs"] + 18:
         set_status("Too quiet, speak closer", FG_DIM)
         log("rec: below gate %d dBFS, not uploading" % CFG["gate_dbfs"])
-        return
+        return None
 
-    set_status("Transcribing...")
     apply_gain(pcm)
+    # M5.Mic retains only raw pointers and will overwrite this buffer as soon
+    # as it is requeued. Upload a stable copy while capture continues into the
+    # original. At 15 s this is 480 KB, well inside the measured 8 MB free.
+    return pcm[:]
+
+
+def recognize(pcm):
+    """Transcribe a stable PCM copy, returning (text, source) or None."""
+    global last_orig, last_src
+
     text, lang = transcribe(pcm)
     gc.collect()
 
@@ -887,102 +1068,113 @@ def handle(pcm):
     if looks_hallucinated(text):
         set_status("No speech detected", FG_DIM)
         log("stt: discarded %r (lang=%r)" % (text, lang))
-        return
+        return None
 
-    src = lang if lang in ("en", "ja") else detect_source(text)
-    log("stt: [%s] %s" % (src, text))
+    # Character inspection is decisive for this two-language app. In a live
+    # Japanese test gpt-transcribe repeatedly returned lang="en" for kana and
+    # kanji, which selected the wrong translation direction and LCD font.
+    src = detect_source(text)
+    log("stt: [%s, api=%r] %s" % (src, lang, text))
+    last_src = src
     last_orig = text
-    draw_region(36, 94, last_orig, FG_ORIG)
+    # Keep the previous large translation readable until its replacement is
+    # complete; only the compact HEARD preview changes during the next POST.
+    update_display()
     set_status("JA to EN" if src == "ja" else "EN to JA")
+    return text, src
 
+
+def finish_translation(recognized):
+    """Translate recognized text while both microphone queue slots run."""
+    global last_trans, last_trans_lang
+
+    text, src = recognized
     last_trans = translate(text, src)
+    last_trans_lang = "en" if src == "ja" else "ja"
     log("tt: %s" % last_trans)
-    draw_region(137, 100, last_trans, FG_TRANS)
+    update_display()
     gc.collect()
 
 
 def run_session():
-    """Capture and upload in a loop, with the mic open during every network call.
+    """Continuously rotate M5.Mic's two FIFO buffers around the API calls."""
+    global capture_buffers
 
-    The ADF capture task is independent of the interpreter, so reopening the
-    mic into the other buffer BEFORE the upload means the board listens for the
-    whole time it is talking to OpenAI. No _thread is needed, the second core
-    is already doing the work.
-    """
-    set_channels(1)
-    # Always create_pcm_buf. record_into on a plain bytearray crashes this
-    # firmware, verified twice, see the FACTS section of CLAUDE.md.
-    cur = recorder.create_pcm_buf(CFG["chunk_seconds"])
-    nxt = recorder.create_pcm_buf(CFG["chunk_seconds"])
-    log("pipeline: 2 x %d byte buffers, %d s per chunk" % (len(cur), CFG["chunk_seconds"]))
+    if M5.Mic.isRecording():
+        drain_captures()
+    size = SAMPLE_RATE * int(CFG["chunk_seconds"]) * 2
+    capture_buffers = [bytearray(size), bytearray(size)]
+    cur, nxt = capture_buffers
+    log("pipeline: M5.Mic FIFO 2 x %d bytes, %d s per chunk" % (size, CFG["chunk_seconds"]))
 
-    set_status("Listening...")
-    start_capture(cur)
+    set_status("Listening  ~%d s" % CFG["chunk_seconds"])
+    queue_capture(cur)
+    queue_capture(nxt)
+    estimated_done = time.ticks_add(time.ticks_ms(), int(CFG["chunk_seconds"]) * 1000)
 
-    while running:
-        wait_for_capture()
-        if not running:
-            break
-        # Reopen the mic into the other buffer BEFORE the slow network work.
-        start_capture(nxt)
-        set_status("Listening and sending...")
-        try:
-            handle(cur)
-        finally:
+    try:
+        while running:
+            wait_for_front_buffer(estimated_done)
+            if not running:
+                break
+
+            upload_pcm = prepare_chunk(cur)
+            # The upload owns a stable copy now. Requeue the original before
+            # either API call so both FIFO slots cover the network round trip.
+            queue_capture(cur)
+            cur, nxt = nxt, cur
+            estimated_done = time.ticks_add(estimated_done, int(CFG["chunk_seconds"]) * 1000)
+            if upload_pcm is not None:
+                set_status("Listening and transcribing...")
+                recognized = recognize(upload_pcm)
+            else:
+                recognized = None
+            if recognized is not None:
+                set_status("Listening and translating...")
+                finish_translation(recognized)
             gc.collect()
-        cur, nxt = nxt, cur
-
-    # Let the in flight capture run itself out rather than calling stop().
-    while not capture_done():
-        M5.update()
-        time.sleep_ms(50)
+    finally:
+        if M5.Mic.isRecording():
+            set_status("Finishing queued audio...", FG_DIM)
+            drain_captures()
+        capture_buffers = None
 
 
 # ------------------------------------------------------------------ lifecycle
 
 
 def probe_channels():
-    """Build the one and only Recorder, and confirm both mics are distinct.
-
-    Every audio.Recorder(...) leaks a 4 KB FreeRTOS task that is never freed,
-    so this must run exactly once per boot. The board has two real MEMS mics,
-    U12 on ES7210 channel 1 and U13 on channel 2. stereo=False mixes them
-    rather than picking one, so stereo is used and the app reads channel 0.
-    """
-    global recorder, channels
-    import audio
-
-    want_stereo = bool(CFG["stereo"])
-    recorder = audio.Recorder(SAMPLE_RATE, 16, want_stereo)
-    channels = 2 if want_stereo else 1
-    log("recorder: created %d Hz 16 bit %d ch" % (SAMPLE_RATE, channels))
-
-    boost_analog_gain(CFG["analog_gain_code"])
-
-    if channels == 2:
-        probe = recorder.create_pcm_buf(1)
-        try:
-            recorder.record_into(probe, sync=True)
-            d1 = channel_dbfs(probe, 0, 2)
-            d2 = channel_dbfs(probe, 1, 2)
-            same = 0
-            checked = 0
-            for i in range(0, len(probe) - 3, 400):
-                checked += 1
-                if probe[i] == probe[i + 2] and probe[i + 1] == probe[i + 3]:
-                    same += 1
-            log("recorder: mic1=%.1f mic2=%.1f dBFS identical=%d/%d" % (d1, d2, same, checked))
-        except Exception as e:
-            log("recorder: stereo probe failed %r" % e)
+    """Start the persistent microphone task and confirm both physical mics."""
+    configure_mic()
+    probe = bytearray(SAMPLE_RATE * 2 * 2)
+    try:
+        if not M5.Mic.record(probe, SAMPLE_RATE, True):
+            raise RuntimeError("stereo queue failed")
+        while M5.Mic.isRecording():
+            time.sleep_ms(20)
+        d1 = channel_dbfs(probe, 0, 2)
+        d2 = channel_dbfs(probe, 1, 2)
+        same = 0
+        checked = 0
+        for i in range(0, len(probe) - 3, 400):
+            checked += 1
+            if probe[i] == probe[i + 2] and probe[i + 1] == probe[i + 3]:
+                same += 1
+        log("mic: mic1=%.1f mic2=%.1f dBFS identical=%d/%d" % (d1, d2, same, checked))
+    except Exception as e:
+        log("mic: stereo probe failed %r" % e)
 
 
 def setup():
-    global font_ja, font_ui
+    global font_ja, font_label, font_source_en, font_trans_en, font_ui
     log("boot: translator starting")
     M5.begin()
     try:
         font_ja = M5.Lcd.FONTS.AlibabaSansJA24
         font_ui = M5.Lcd.FONTS.Montserrat16
+        font_label = M5.Lcd.FONTS.Montserrat12
+        font_source_en = M5.Lcd.FONTS.Montserrat18
+        font_trans_en = M5.Lcd.FONTS.Montserrat24
     except Exception as e:
         log("fonts: %r" % e)
     if font_ja is not None:
@@ -1005,7 +1197,7 @@ def setup():
 
 
 def loop():
-    global running, fatal
+    global running, fatal, settings_requested
     M5.update()
 
     pos = tap()
@@ -1041,6 +1233,11 @@ def loop():
         log_exc(e)
         running = False
         set_status("ERR %s" % e, FG_ALERT)
+
+    if settings_requested:
+        settings_requested = False
+        settings_page()
+        set_status("Tap screen to start")
 
 
 def run():

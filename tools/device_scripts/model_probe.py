@@ -6,10 +6,11 @@ per-account, so probe before hardcoding. Prints status codes only, no secrets.
 
 import json
 import struct
+import time
 
+import M5
 import network
 import requests2
-from audio import Recorder
 
 CFG = {}
 for p in ("/flash/config.json", "/flash/res/config.json"):
@@ -39,7 +40,15 @@ for model in ("gpt-5.6-luna", "gpt-5-nano", "gpt-4o-mini"):
     if model.startswith("gpt-5"):
         body["reasoning_effort"] = "none"
     try:
-        r = requests2.post("https://api.openai.com/v1/chat/completions", json=body, headers=H)
+        payload = json.dumps(body).encode()
+        headers = dict(H)
+        headers["Content-Type"] = "application/json"
+        r = requests2.post(
+            "https://api.openai.com/v1/chat/completions",
+            data=payload,
+            headers=headers,
+            timeout=45,
+        )
         if r.status_code == 200:
             print("  %-14s 200  %s" % (model, r.json()["choices"][0]["message"]["content"]))
         else:
@@ -48,9 +57,15 @@ for model in ("gpt-5.6-luna", "gpt-5-nano", "gpt-4o-mini"):
         print("  %-14s EXC %s" % (model, e))
 
 print("\n=== transcription models ===")
-rec = Recorder(16000, 16, False)
-pcm = rec.create_pcm_buf(2)
-rec.record_into(pcm, sync=True)
+M5.begin()
+M5.Mic.end()
+M5.Mic.config(sample_rate=16000, magnification=2, task_pinned_core=0)
+M5.Mic.begin()
+pcm = bytearray(64000)
+M5.Mic.record(pcm, 16000, False)
+while M5.Mic.isRecording():
+    time.sleep_ms(20)
+M5.Mic.end()
 hdr = struct.pack(
     "<4sI4s4sIHHIIHH4sI",
     b"RIFF",
@@ -90,11 +105,25 @@ def upload(model, extra_fields):
     body += ("\r\n--" + B + "--\r\n").encode()
     hh = dict(H)
     hh["Content-Type"] = "multipart/form-data; boundary=" + B
-    return requests2.post("https://api.openai.com/v1/audio/transcriptions", data=body, headers=hh)
+    return requests2.post(
+        "https://api.openai.com/v1/audio/transcriptions",
+        data=body,
+        headers=hh,
+        timeout=45,
+    )
 
 
 for model, extra in (
-    ("gpt-transcribe", [("languages[]", "en"), ("languages[]", "ja"), ("response_format", "json")]),
+    (
+        "gpt-transcribe",
+        [
+            ("languages[]", "en"),
+            ("languages[]", "ja"),
+            ("keywords[]", "FOSS4G"),
+            ("keywords[]", "GeoParquet"),
+            ("response_format", "json"),
+        ],
+    ),
     ("gpt-4o-mini-transcribe", [("response_format", "json")]),
     ("whisper-1", [("response_format", "json")]),
 ):
