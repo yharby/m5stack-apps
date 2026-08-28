@@ -1,0 +1,7 @@
+{
+  "wifi_ssid": "",
+  "wifi_pass": "",
+  "openai_api_key": "sk-REPLACE-ME",
+  "whisper_model": "whisper-1",
+  "chat_model": "gpt-4o-mini"
+}

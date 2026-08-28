@@ -3,7 +3,7 @@
 
 M5 := uv run python tools/m5.py
 
-.PHONY: help setup info ls logs clear-logs push run repl reset probe lint
+.PHONY: help setup info ls logs clear-logs push run repl reset probe lint format check
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -38,5 +38,12 @@ reset:      ## reboot the device back into UIFlow2
 probe:      ## hardware smoke test (mic, wifi, display, config)
 	@$(M5) probe
 
-lint:       ## lint host-side tooling
-	uv run ruff check tools/
+lint:       ## lint device + host code
+	uv run ruff check device/ tools/
+
+format:     ## auto-format device + host code
+	uv run ruff format device/ tools/
+
+check:      ## format-check + lint (CI gate)
+	uv run ruff format --check device/ tools/
+	uv run ruff check device/ tools/
