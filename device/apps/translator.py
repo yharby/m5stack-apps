@@ -46,6 +46,32 @@ SAMPLE_RATE = 16000
 RECORD_SECONDS = 5
 LOG_PATH = "/flash/translator.log"
 
+# Measured on this unit: quiet room about -55 dBFS, speech peaks about -37 dBFS.
+# Below this gate we do not upload, because Whisper invents confident text
+# from silence (a silent clip returned "thank you for watching" in Japanese).
+SILENCE_GATE_DBFS = -45.0
+
+# Phrases Whisper is known to emit for silence / noise-only audio.
+HALLUCINATIONS = (
+    "ご視聴ありがとうございました",
+    "ご視聴ありがとうございます",
+    "おやすみなさい",
+    "チャンネル登録",
+    "thank you for watching",
+    "thanks for watching",
+    "please subscribe",
+    "subtitles by",
+    "amara.org",
+)
+
+
+def looks_hallucinated(text):
+    t = text.strip().lower().rstrip(".!?。！？")
+    if not t:
+        return True
+    return any(h.lower() in t for h in HALLUCINATIONS)
+
+
 W, H = 320, 240
 BG = 0x000000
 FG_STATUS = 0x00CFFF
@@ -227,19 +253,6 @@ def pcm_to_wav(pcm):
     return wav
 
 
-def pcm_rms(pcm):
-    n = len(pcm) // 2
-    if n == 0:
-        return 0
-    acc = 0
-    count = 0
-    for i in range(0, n, 11):
-        v = struct.unpack_from("<h", pcm, i * 2)[0]
-        acc += v * v
-        count += 1
-    return int((acc / count) ** 0.5)
-
-
 # ------------------------------------------------------------------ network
 
 BOUNDARY = "----M5CoreS3TranslatorBoundary"
@@ -331,11 +344,16 @@ def process_chunk():
 
     set_status("Listening %ds..." % RECORD_SECONDS)
     pcm = record_pcm(RECORD_SECONDS)
-    level = pcm_rms(pcm)
-    log("rec: %d bytes rms=%d" % (len(pcm), level))
-    if level < 15:
-        set_status("Too quiet - speak up", FG_DIM)
-        log("rec: below noise floor, skipping upload")
+    # recorder.rms() is the firmware's own meter in dBFS, far cheaper than
+    # summing 160k samples in MicroPython.
+    try:
+        level = recorder.rms()
+    except Exception:
+        level = 0.0
+    log("rec: %d bytes level=%.1f dBFS" % (len(pcm), level))
+    if level < SILENCE_GATE_DBFS:
+        set_status("Too quiet - speak closer", FG_DIM)
+        log("rec: %.1f dBFS below gate %.1f, not uploading" % (level, SILENCE_GATE_DBFS))
         return
 
     set_status("Transcribing...")
@@ -345,8 +363,9 @@ def process_chunk():
     text = (transcribe(wav) or "").strip()
     del wav
     gc.collect()
-    if not text:
+    if looks_hallucinated(text):
         set_status("No speech detected", FG_DIM)
+        log("stt: discarded as silence artefact: %r" % text)
         return
 
     src = detect_source(text)
