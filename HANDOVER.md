@@ -1,118 +1,103 @@
 # Handover, M5Stack CoreS3 translator
 
-Updated 2026-08-28 after the blocker was resolved and tested on the real
-device. Read `CLAUDE.md` first; its FACTS section is the durable reference.
+Updated 2026-08-28 after a latency and smoothness pass. Read `CLAUDE.md`
+first, its FACTS section is the durable reference and it now contains
+corrected entries that contradict earlier notes.
 
-## Current status: working
+## Current status: working, measurably faster
 
-The translator now records continuously enough for practical use, transcribes
-and translates in both directions, and keeps the LCD responsive between
-network calls. The user tested the six-second UI and said it was working very
-well.
+Four workstreams landed together on `perf/integration` and were verified on
+the physical board.
 
-The production design is `M5.Mic`, not `audio.Recorder`:
+| Stage | Before | After |
+|---|---|---|
+| Transcription | 2.0 to 2.9 s | 1.75 to 1.94 s |
+| Translation | 2.7 to 3.4 s | 1.7 to 2.5 s |
+| Pipeline total | ~5.2 s | ~3.7 s |
 
-- One persistent M5Unified mic task is pinned to core 0.
-- Two mono `bytearray` buffers are kept in the mic's FIFO.
-- When the oldest buffer finishes, the app copies it, immediately requeues
-  the original, then transcribes and translates the stable copy.
-- Capture therefore continues while MicroPython is blocked in TLS.
-- On stop, the app ceases requeues and drains both raw buffer pointers before
-  allowing the Python objects to be freed.
+## The bug that mattered most
 
-Live end-to-end results with two 192000-byte buffers (six seconds each):
+`HTTP_THREAD_STACK` was 32768. **A 32 KB task stack cannot be allocated on
+this board.** Every POST raised `OSError("can't create thread")`, fell through
+`do_post`'s two retries, and took the blocking fallback:
 
-- Requeue took 0-1 ms.
-- Viper 4x gain took about 35 ms for 96000 samples.
-- Steady transcription took roughly 2-6 s.
-- Translation generally took 2-3 s.
-- Repeated English-to-Japanese chunks, silence gating, and Japanese speech
-  were all exercised without an audio restart hang.
+```
+http: worker start retry after OSError("can't create thread",)
+http: worker unavailable OSError("can't create thread",); using blocking POST
+```
 
-## Important fix made after the first successful run
+So the documented "main thread keeps calling `M5.update()` during TLS" design
+had never actually run, and touch was dead during every network call. The
+previous notes claiming a verified 32 KB stack were wrong.
 
-`gpt-transcribe` repeatedly returned language `en` for transcripts containing
-obvious Japanese kana and kanji. Trusting that metadata selected the wrong
-translation direction and made the LCD render Japanese with a Latin font,
-which appeared as boxes.
+`tools/device_scripts/thread_probe.py` shows 16384, 8192, 4096 and 2048 create
+fine and 32768 never does. `tools/device_scripts/tls_thread_probe.py` then
+completed a real TLS handshake and full HTTP round trip on stacks down to
+8 KB. The constant is now 16384, and `do_post` steps down through
+16384/12288/8192 before it will ever block again.
 
-`recognize()` now determines EN versus JA from the returned text itself. The
-display independently inspects the text before selecting its glyph font, so a
-bad API language label cannot produce boxes again. A second live run verified
-Japanese speech was logged as `[ja, api='en']` and translated into English.
+Re-probe before raising that value.
 
-## Why `audio.Recorder` was abandoned
+## What changed
 
-The original ADF experiment proved that one asynchronous capture could fill a
-buffer during a blocking 33-second TLS request. But restarting it is unsafe:
+**Transport.** `KeepAliveClient` holds one HTTP/1.1 TLS socket to
+api.openai.com and reuses it for every call in a session. Raw `socket` + `ssl`
+works on this firmware, the handshake costs about 540 ms, and a full
+multi-turn session now logs exactly one `keep-alive TLS` line instead of two
+per turn. `requests2` remains an automatic fallback that latches off after
+three consecutive failures. `prewarm()` opens the socket at boot.
 
-- cycle 0 returned in 57 ms and `is_recording()` became false after 3219 ms;
-- cycle 1 returned in 3 ms but never settled within 15 seconds;
-- the next restart or `stop()` enters an untimed firmware spin wait and wedges
-  the board until a physical hard reset.
+**Capture.** Audio is no longer sliced on a wall clock. 1 s frames go into a
+ring, each 100 ms window is scored against the gate, and an utterance closes
+on 600 ms of trailing quiet after at least 400 ms of speech. `chunk_seconds`
+is now the ceiling for when the talker never pauses, mapped 1:1 so a monologue
+is never slower than the old fixed slice. `poll_session_controls()` doubles as
+the audio pump, keeping both FIFO slots filled during network waits.
 
-Plain `bytearray` was never the problem: `create_pcm_buf()` returns the same
-type. The decisive scripts are kept in `tools/device_scripts/async_settle.py`,
-`m5_mic_queue.py`, and `m5_mic_cancel.py`.
+**Rendering.** `wrap_text` was O(n squared), measuring the whole growing line
+per character across up to four candidate fonts, roughly sixteen full passes
+per turn. It is linear now with a glyph-width cache. Regions skip repaint when
+unchanged, and both text regions draw through `M5.Lcd.newCanvas` double
+buffers, verified working at `bpp=16, psram=True`.
 
-## M5.Mic evidence
+**Plumbing.** The log file is held open instead of reopened per line, still
+flushed per line so it survives a wedge, and rotated at 64 KB. `ensure_wifi()`
+existed but was never called, so a dropped link surfaced as an opaque 45 s
+timeout; it now runs at boot and before each session. Wi-Fi modem power save
+is off, `pm` is the key this build accepts.
 
-The replacement was verified against UIFlow2 2.5.1 and M5Unified source, then
-on the physical CoreS3:
+## Known remaining gaps
 
-- `M5.Mic.record(buf, 16000, False)` queues asynchronously.
-- `isRecording()` is queue occupancy 0/1/2.
-- Six consecutive three-second captures completed, followed by `end()`,
-  `begin()`, and another successful capture.
-- Calling `end()` 350 ms into a five-second capture waited the remaining
-  4.65 s; it does not cancel an active buffer. The app drains instead.
-- Mono mixes the two physical ES7210 mic channels. Stereo is used only for
-  the channel probe and the responsive 150 ms settings meters.
-- `M5.Mic` and `audio.Recorder` both own I2S1 and must not coexist.
+1. **Endpointing is unverified on conversational speech.** Every device test
+   used continuous podcast audio with no pauses, so the endpointer always hit
+   the ceiling and the silence trimmer never trimmed. Both paths need a real
+   two-person conversation to exercise. Expect `utt: closed N frames, ...`
+   with a non-zero trailing-quiet count when it is working.
+2. **A capture gap remains during upload preparation.** One
+   `mic: FIFO empty, pump not called for 1596 ms, audio dropped` still appears
+   per session. Nothing pumps during `prepare_chunk`'s gain pass (~260 ms) and
+   the multipart body build, so a little audio is still lost there.
+3. **The prewarmed socket does not always survive to the first utterance.**
+   A second handshake sometimes appears on the first real POST. Reuse within a
+   session is the reliable win, the boot prewarm is a bonus.
+4. **Deferred by design.** Collapsing transcription and translation into one
+   audio-input call, and streaming the translation over SSE, are the two
+   largest remaining wins. Both depend on the socket layer, which is why they
+   were held back until keep-alive proved out on hardware.
 
-## UI and HTTP changes
+## Watch the log for
 
-- Default chunk duration is six seconds for quicker page changes and shorter
-  sentences.
-- The HEARD preview is compact; TRANSLATION gets most of the screen.
-- English text chooses among several font sizes using measured wrapping.
-- Japanese uses `AlibabaSansJA24`; font choice is based on the actual text.
-- Common smart punctuation is normalized only for LCD rendering so a missing
-  Latin glyph cannot appear as an isolated box.
-- The hallucination filter uses ASCII-only case folding. MicroPython's full
-  `str.lower()` raised `UnicodeError` on one real Japanese transcript.
-- The previous translation remains visible until its replacement is ready.
-- The top status shows an approximate listening countdown.
-- Settings use 150 ms stereo frames, giving responsive independent mic bars.
-- Chat JSON is explicitly UTF-8 encoded before POST. `requests2`'s `json=`
-  path uses character count for Content-Length and broke Japanese/em-dash
-  payloads with HTTP 400.
-- `gpt-transcribe` receives a concise `keywords[]` glossary for canonical
-  FOSS4G/OSGeo terminology. The translation prompt preserves canonical names,
-  uses consistent STAC nouns, and resolves explicit spoken self-corrections.
-  Device verification returned HTTP 200, recognized `OSGeo JP` in Japanese
-  speech, and translated a Japanese test sentence while preserving `FOSS4G`,
-  `STAC`, and `GeoParquet`. The full glossary adds about 3.8 KB to a 192 KB
-  six-second upload and did not measurably change the roughly two-second
-  steady translation time.
-
-## Final verification
-
-- Ruff formatting, lint, and `git diff --check` pass.
-- The finalized app was pushed to `/flash/apps/translator.py`.
-- A live Japanese run produced multiple correctly directed English results.
-- The same run produced curly U+2019 punctuation such as `today’s`; the
-  LCD-only normalizer deterministically renders it as ASCII `today's`, which
-  is present in the Latin font.
-- `make probe` and `make selftest` are updated to use `M5.Mic`. The selftest
-  deliberately sends Japanese JSON to cover the UTF-8 Content-Length bug.
-
-If USB remains present but every command hangs inside a C call, ask the user
-to hard reset: hold power about six seconds, then press once. Native USB CDC
-has no EN line for the host to toggle.
+```
+http: keep-alive TLS to api.openai.com in 541 ms   once per session, not per call
+http: POST worker stack is now 16384 bytes         the thread fix working
+utt: closed 7 frames, 63 speech windows, 0 trailing quiet
+rec: trimmed 224000 to 138000 bytes                trimmer actually firing
+mic: FIFO empty, pump not called for N ms          capture gap, see gap 2
+http: keep-alive disabled for this run             fell back to requests2
+```
 
 ## Security
 
-The OpenAI API key pasted in the original conversation must be rotated. Never
-echo it. The real config stays only at `/flash/res/config.json`, and
-`.gitignore` blocks `config.json`.
+The OpenAI API key must be rotated if it was ever pasted into a conversation.
+Never echo it. Real config stays only at `/flash/res/config.json`, and
+`.gitignore` blocks `config.json` everywhere.
