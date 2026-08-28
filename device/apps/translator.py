@@ -2,7 +2,7 @@
 
 Tap the screen or press the power button to start and stop. Tap the gear in
 the top right for the settings page, which shows live mic meters and lets you
-change the sensitivity gate and the chunk length. Every stage is logged to
+change the sensitivity gate and the maximum utterance length. Every stage is logged to
 /flash/translator.log and to the serial console.
 
 Device API facts, all verified by probing this board or by reading the
@@ -119,9 +119,9 @@ CFG = {
     # higher than the broken recorder.rms(). Quiet room is about -55 dBFS on
     # this unit and speech peaks about -32 dBFS, so -52 is deliberately hot.
     "gate_dbfs": -52,
-    # Seconds of audio per API call. Two buffers remain queued while the
-    # previous chunk is uploaded. Six seconds feels responsive and generally
-    # gives the network enough audio runway without producing long sentences.
+    # Upper bound in seconds on one utterance. Speech is normally cut on a
+    # natural pause, so this only applies when the talker never stops. It is
+    # still what the settings stepper moves.
     "chunk_seconds": 6,
     # Digital gain applied to the PCM before upload, 1 to 16. Speech peaks at
     # about -32 dBFS on this unit so there is roughly 30 dB of headroom.
@@ -1196,11 +1196,14 @@ def analyze_frame(pcm, rms_out, peak_out):
 def utterance_max_seconds():
     """Ceiling on one utterance, derived from the chunk_seconds tunable.
 
-    chunk_seconds is no longer a fixed slice length, but it is still what the
-    settings stepper moves, so the endpointer's upper bound follows it and
-    turning the stepper down still shortens the longest possible sentence.
+    chunk_seconds is no longer a fixed slice length, it is the upper bound the
+    endpointer falls back to when the talker never pauses. It maps 1:1 rather
+    than adding headroom: on continuous speech the endpointer never fires, so
+    any headroom here would make a monologue slower than the old fixed slice
+    instead of merely no faster. Measured on device against a podcast with no
+    pauses, chunk_seconds + 2 closed every utterance at the ceiling.
     """
-    s = int(CFG["chunk_seconds"]) + 2
+    s = int(CFG["chunk_seconds"])
     if s < 4:
         s = 4
     elif s > 12:
