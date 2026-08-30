@@ -12,9 +12,6 @@ Bounded and read only. It creates no widgets and writes no files.
 """
 
 import lvgl as lv
-import m5ui
-
-m5ui.init()
 
 FONTS = (
     ("translator_cairo_16", "translator_cairo_16"),
