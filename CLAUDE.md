@@ -9,7 +9,7 @@ app-specific complexity inside its app or handover document.
 | App | Purpose | Required I/O |
 |---|---|---|
 | `wifi_qr.py` | Confirmed QR-based UIFlow2 Wi-Fi provisioning | camera, LCD, touch, Wi-Fi/NVS |
-| `translator.py` | Realtime EN ↔ JA geospatial interpretation | microphones, LCD, touch, Wi-Fi; optional SD |
+| `translator.py` | Realtime multilingual geospatial interpretation | microphones, LVGL display/touch, Wi-Fi; optional SD |
 
 ## Verified target
 
@@ -68,7 +68,8 @@ plain `mpremote connect`, and do not compete with the UIFlow2 web IDE or a
 ## App contract
 
 - One app is one `device/apps/<name>.py` file with no sibling import required.
-- Call `M5.begin()` once, then call `M5.update()` on every interactive loop.
+- Initialize the board once, then call `M5.update()` on every interactive loop.
+  `m5ui.init()` already calls `M5.begin()`; never call both in one app.
 - Keep touch/network waits bounded and continue pumping UI events inside them.
 - Use truthful states such as checking, connecting, connected, and failed.
 - Require confirmation before persistent or disruptive changes.
@@ -87,8 +88,31 @@ plain `mpremote connect`, and do not compete with the UIFlow2 web IDE or a
 - CoreS3 has no usable BtnA/B/C strip; only `BtnPWR` is physical.
 - Colors are 24-bit `0xRRGGBB`; there is no `color565()`.
 - Pass colors explicitly because omitted color means reuse the previous value.
-- Japanese requires `M5.Lcd.FONTS.AlibabaSansJA24`.
-- Use `textWidth()` for wrapping. Do not estimate mixed Latin/CJK widths.
+- Direct M5GFX Japanese requires `M5.Lcd.FONTS.AlibabaSansJA24`.
+- Translator uses raw LVGL widgets after `m5ui.init()` so touch scrolling,
+  wrapping, clipping, bidi ordering, and Arabic shaping share one renderer.
+- Apply RTL only to Arabic/Hebrew labels, never to the feed. Keep canonical
+  logical-order text in Python; LVGL label getters may return shaped text.
+- Arabic/Hebrew sessions require `translator_rtl.ABI_VERSION == 2`,
+  `LV_USE_BIDI=1`, `LV_USE_ARABIC_PERSIAN_CHARS=1`, and both 16/24 px faces:
+  Cairo for Arabic and Noto Sans Hebrew for Hebrew. Those generated subsets
+  stay under OFL-1.1; preserve `firmware/fonts/OFL-1.1.txt` in distributions.
+- `lv_font_conv` compresses bpp 2 and bpp 4 output unless `--no-compress` is
+  passed, emitting `bitmap_format = 1`. A compressed font needs
+  `LV_USE_FONT_COMPRESSED=1` or LVGL returns NULL for every glyph bitmap and
+  the software draw path dereferences it, hard-resetting the board with no
+  backtrace over USB CDC. Verify the pairing whenever fonts are regenerated.
+- A font symbol resolving at runtime proves only that it linked. Prove a font
+  by rendering a shaped two-character string, not by its presence.
+- An empty box on screen is LVGL's missing-glyph placeholder, not a shaping
+  bug. With `LV_USE_FONT_PLACEHOLDER` on, `lv_font_get_glyph_dsc_internal()`
+  sets `box_w` to half the line height and draws a rectangle. Each box is
+  exactly one code point absent from the subset.
+- A `lv_font_conv` range is a request. It emits only glyphs the source TTF
+  holds, so read real coverage from the generated `cmaps` array. The shipped
+  subsets cover `0x20-0x7E` and their script block only, so typographic
+  punctuation must be folded onto ASCII in Python before it reaches a label.
+- Direct-canvas apps should use `textWidth()` for wrapping mixed Latin/CJK.
 - `newCanvas(..., bpp=16, psram=True)` is verified for flicker-free regions.
 - LCD and SD share SPI pins. Finish drawing before SD I/O and keep writes short.
 - Surface optional-device problems in the UI, but do not trap the user in an
@@ -186,6 +210,12 @@ associated and received an IP address.
 `requests2` is synchronous, has no `files=`, and its `json=` path miscomputes
 UTF-8 `Content-Length` for non-ASCII text. Encode JSON yourself and pass
 `data=json.dumps(payload).encode()`.
+
+The OpenAI transcription `languages[]` and `keywords[]` multipart fields are
+accepted only by `gpt-transcribe`. Sending them to `gpt-4o-transcribe` or
+`gpt-4o-mini-transcribe` fails the whole request with HTTP 400
+`invalid_parameter`, so gate them on the configured model rather than always
+sending them.
 
 Translator HTTP work runs on a 16 KB `_thread` stack while the main thread
 pumps touch and microphone capture. A 32 KB stack cannot be allocated on this

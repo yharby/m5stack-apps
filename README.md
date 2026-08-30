@@ -9,7 +9,7 @@ be installed directly into its `APP.LIST` menu.
 | App | What it does | Hardware | Configuration |
 |---|---|---|---|
 | [`wifi_qr`](device/apps/wifi_qr.py) | Scans a standard Wi-Fi QR code and safely switches UIFlow2's saved network | Camera, touch | None |
-| [`translator`](device/apps/translator.py) | Realtime English ↔ Japanese speech translation for FOSS4G and geospatial conversations | Microphones, display, touch, Wi-Fi; optional SD | OpenAI API key |
+| [`translator`](device/apps/translator.py) | Realtime multilingual translation with a scrollable bidi conversation feed | Microphones, display, touch, Wi-Fi; optional SD | OpenAI API key; RTL firmware for Arabic/Hebrew |
 
 Both apps are production-tested on an M5Stack CoreS3 with UIFlow2 `2.5.1` and
 MicroPython `1.27.0`. Compatibility with other M5Stack models is not assumed;
@@ -57,9 +57,9 @@ After connecting, choose **SCAN AGAIN** or **EXIT**. EXIT and the power button
 clean up the camera and reboot into the UIFlow2 launcher. CoreS3 Wi-Fi is
 2.4 GHz; a 5 GHz-only network cannot be used.
 
-## Geo Translator
+## Multilingual Translator
 
-The translator provides pocket English ↔ Japanese interpretation optimized for
+The translator provides pocket multilingual interpretation optimized for
 FOSS4G and open-geospatial terminology:
 
 ```text
@@ -68,10 +68,16 @@ CoreS3 mics → pause detection → transcription → translation → LCD
 ```
 
 It uses natural-pause endpointing, a reusable HTTP/1.1 TLS connection,
-continuous microphone capture, automatic language direction, and flicker-free
-EN/JA rendering. On the tested device, the optimized pipeline completed in
-about 3.7 seconds compared with roughly 5.2 seconds for the original fixed-slice
-implementation.
+continuous microphone capture, script-aware automatic direction, and an LVGL
+turn feed. The feed follows new turns until the user scrolls away; **LIVE**
+returns to the newest turn. Heard text is compact and the translation is the
+visual focus. Dedicated pair, start/stop, live, and settings controls prevent
+a feed gesture from stopping capture.
+
+Pair choices are English, Japanese, Korean, Simplified Chinese, Arabic,
+Hebrew, and horizontal Cyrillic Mongolian. Traditional vertical Mongolian is
+not silently approximated. Arabic/Hebrew text stays in logical Unicode order
+for APIs and transcripts; LVGL handles bidi ordering and contextual shaping.
 
 Copy the example configuration, add the OpenAI credential, and place the
 private file at `/flash/res/config.json`:
@@ -84,9 +90,31 @@ Wi-Fi fields in that file are optional fallbacks. The translator normally uses
 the network currently selected by UIFlow2—including one selected by
 `wifi_qr`—and re-reads those settings whenever it needs to reconnect.
 
-Tap the screen to start or pause. Tap the gear for microphone meters and
-sensitivity controls. `Chunk` is the maximum utterance length when no natural
-pause occurs.
+Use **START/STOP** to control capture, tap the pair control to choose languages,
+and use **SET** for audio/storage controls. `Chunk` is the maximum utterance
+length when no natural pause occurs.
+
+### Arabic and Hebrew firmware
+
+Stock UIFlow2 2.5.1 disables LVGL bidi, Arabic contextual shaping, and its
+Arabic/Hebrew font. Translator refuses to start an Arabic/Hebrew pair unless a
+firmware ABI marker proves all three are enabled. Prepare a current UIFlow2
+checkout after its normal `submodules` and `patch` steps:
+
+```bash
+make rtl-firmware-patch UIFLOW_DIR=/path/to/uiflow-micropython
+make -C /path/to/uiflow-micropython/m5stack littlefs
+make -C /path/to/uiflow-micropython/m5stack BOARD=M5STACK_CoreS3 pack_all
+```
+
+The patch is exact and idempotent. It enables bidi and Arabic/Persian shaping,
+then embeds compact 16 px heard-text and readable 24 px translation faces:
+Cairo for Arabic and Noto Sans Hebrew for Hebrew. It freezes a
+`translator_rtl.ABI_VERSION == 2` capability marker, and the app refuses an
+RTL session unless every required face is present. Both font subsets remain
+under SIL OFL 1.1; source pins, generator details, and the license are in
+[`firmware/fonts`](firmware/fonts/README.md). Flash and visually validate
+Arabic/Hebrew on the real display before release.
 
 ### Optional SD transcripts
 
@@ -138,7 +166,7 @@ make sd-probe                # SD mount, capacity, write/read/sync test
 make selftest                # translator network/mic/OpenAI end-to-end test
 make logs                    # read /flash/translator.log
 make reset                   # reboot into UIFlow2
-make check                   # formatting and lint
+make check                   # formatting, lint, and host language/UI tests
 ```
 
 To add an app, place one self-contained MicroPython file in `device/apps/`.

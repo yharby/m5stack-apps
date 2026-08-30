@@ -9,9 +9,10 @@
 
 M5  := uv run python tools/m5.py
 APP ?= translator
+UIFLOW_DIR ?=
 
-.PHONY: help setup catalog info ls apps push autorun rm-app run selftest sd-probe probe \
-        repl reset logs clear-logs lint format check
+.PHONY: help setup catalog info ls apps push push-config autorun rm-app run selftest sd-probe probe \
+        repl reset logs clear-logs rtl-firmware-patch test lint format check
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -33,6 +34,9 @@ apps:       ## list apps installed on the device
 
 push:       ## install app to /flash/apps/<name>.py        (APP=name)
 	@$(M5) push $(APP)
+
+push-config: ## validate + atomically install device/config.json
+	@$(M5) push-config
 
 autorun:    ## also install app as /flash/main.py (runs on boot)
 	@$(M5) autorun $(APP)
@@ -64,12 +68,20 @@ logs:       ## print the translator log                    (make logs n=100)
 clear-logs: ## delete the on-device app log
 	@$(M5) clear-logs
 
+rtl-firmware-patch: ## enable LVGL Arabic/bidi in a prepared UIFlow2 checkout
+	@test -n "$(UIFLOW_DIR)" || (echo "usage: make rtl-firmware-patch UIFLOW_DIR=/path/to/uiflow-micropython"; exit 2)
+	uv run python tools/patch_uiflow_rtl.py "$(UIFLOW_DIR)"
+
+test:       ## host-side translator language, RTL, feed, and geometry tests
+	python3 -m unittest discover -s tests -v
+
 lint:       ## lint device + host code
-	uv run ruff check device/ tools/
+	uv run ruff check device/ tools/ tests/
 
 format:     ## auto-format device + host code
-	uv run ruff format device/ tools/
+	uv run ruff format device/ tools/ tests/
 
 check:      ## format-check + lint (CI gate)
-	uv run ruff format --check device/ tools/
-	uv run ruff check device/ tools/
+	uv run ruff format --check device/ tools/ tests/
+	uv run ruff check device/ tools/ tests/
+	python3 -m unittest discover -s tests
