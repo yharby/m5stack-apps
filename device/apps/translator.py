@@ -1476,6 +1476,46 @@ def _load_screen(screen, callbacks):
             pass
 
 
+# LVGL rewrites Arabic to presentation forms before drawing, so a face that
+# carries the base block can still be unable to draw a word. Cairo 3.130 is
+# exactly that case: its cmap holds every final, initial, and medial form but
+# none of the 36 isolated ones, and isolated position is constant in Arabic
+# (word-initial alef, standalone waw, any letter after a non-joining one).
+# Each one LVGL cannot resolve becomes an empty placeholder box.
+#
+# These are the isolated forms of alef, lam, meem, waw, yeh, and teh. A face
+# that can draw all six can draw the rest; a face missing them is unusable for
+# Arabic no matter what its symbol table says.
+ARABIC_ISOLATED_PROBE = (0xFE8D, 0xFEDD, 0xFEE1, 0xFEED, 0xFEF1, 0xFE95)
+
+# Complete Arabic shaping coverage, verified on device. Only U+06EF, a Persian
+# letter, is absent. Used when the configured face fails the probe above.
+ARABIC_FALLBACK_FONT = "font_dejavu_16_persian_hebrew"
+
+
+def font_covers(font, codes):
+    """True when `font` itself can supply every code point in `codes`.
+
+    The struct callback takes the font as its first argument and reports the
+    answer in its return value. `is_placeholder` is set later by
+    `lv_font_get_glyph_dsc_internal()` once the whole fallback chain has been
+    tried, so it is not the test to use here.
+
+    The fallback chain cannot be repaired from Python. Generated fonts are
+    `const lv_font_t` in flash, and assigning `.fallback` faults the board.
+    """
+    if font is None:
+        return False
+    try:
+        dsc = lv.font_glyph_dsc_t()
+        for code in codes:
+            if not font.get_glyph_dsc(font, dsc, code, 0):
+                return False
+    except Exception:
+        return False
+    return True
+
+
 def font_for_language(code, primary=False):
     script_font = {
         "ja": font_ja,
@@ -3786,6 +3826,25 @@ def setup():
                 font_ar_translation = getattr(lv, translator_rtl.ARABIC_TRANSLATION_FONT, None)
                 font_he_source = getattr(lv, translator_rtl.HEBREW_SOURCE_FONT, None)
                 font_he_translation = getattr(lv, translator_rtl.HEBREW_TRANSLATION_FONT, None)
+                # Prove the configured Arabic faces by asking for the shaped
+                # glyphs LVGL will actually request, not by their presence.
+                # Substituting a complete face keeps Arabic legible at the
+                # cost of one size and a plainer look, which beats a line of
+                # placeholder boxes. When the firmware ships a face that
+                # passes, this check stops substituting on its own.
+                if not font_covers(font_ar_source, ARABIC_ISOLATED_PROBE) or not font_covers(
+                    font_ar_translation, ARABIC_ISOLATED_PROBE
+                ):
+                    spare = getattr(lv, ARABIC_FALLBACK_FONT, None)
+                    if font_covers(spare, ARABIC_ISOLATED_PROBE):
+                        log(
+                            "fonts: %s lacks Arabic isolated forms, using %s"
+                            % (translator_rtl.ARABIC_SOURCE_FONT, ARABIC_FALLBACK_FONT)
+                        )
+                        font_ar_source = spare
+                        font_ar_translation = spare
+                    else:
+                        log("fonts: no Arabic face covers the isolated forms")
         except Exception:
             rtl_firmware_abi = 0
             font_ar_source = None
