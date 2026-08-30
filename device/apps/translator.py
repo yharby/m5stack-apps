@@ -1839,14 +1839,19 @@ def show_main_screen():
     update_display(True)
 
 
-def _select_picker_slot(slot):
-    global ui_action
-    ui_action = ("picker_slot", slot)
-
-
 def _select_language(code):
     global ui_action
     ui_action = ("pick_language", code)
+
+
+def _language_back(_event=None):
+    global ui_action
+    ui_action = ("language_back",)
+
+
+def _language_forward(_event=None):
+    global ui_action
+    ui_action = ("language_forward",)
 
 
 def _done_language(_event=None):
@@ -1863,42 +1868,29 @@ def language_page():
     screen = lv.obj()
     screen.set_size(W, H)
     _style_panel(screen)
-    ui_status = _label(
-        screen, "Choose language %s" % (picker_slot + 1), 8, 8, 160, FG_STATUS, font_label
-    )
+    role = "Source" if picker_slot == 0 else "Target"
+    pair = configured_pair()
+    ui_status = _label(screen, role + " language", 8, 12, 190, FG_STATUS, font_ui)
+    pair_text = "%s -> %s" % (language_short(pair[0]), language_short(pair[1]))
+    pair_label = _label(screen, pair_text, 202, 13, 110, FG_DIM, font_label)
+    pair_label.set_style_text_align(lv.TEXT_ALIGN.RIGHT, 0)
 
-    for slot, x in ((0, 174), (1, 248)):
-
-        def choose_slot(_event, selected=slot):
-            _select_picker_slot(selected)
-
-        callbacks.append(choose_slot)
-        color = FG_ACTIVE if slot == picker_slot else FG_PANEL
-        _button(screen, language_short(configured_pair()[slot]), x, 0, 72, 44, choose_slot, color)
-
-    positions = ((4, 48), (108, 48), (212, 48), (4, 94), (108, 94), (212, 94), (4, 140))
+    positions = ((4, 46), (108, 46), (212, 46), (4, 92), (108, 92), (212, 92), (4, 138))
     for code, pos in zip(LANGUAGE_CODES, positions):
 
         def choose_language(_event, selected=code):
             _select_language(selected)
 
         callbacks.append(choose_language)
-        color = FG_ACTIVE if code in configured_pair() else FG_PANEL
+        color = FG_ACTIVE if code == pair[picker_slot] else FG_PANEL
         _button(
             screen, LANGUAGE_PROFILES[code]["name"], pos[0], pos[1], 100, 44, choose_language, color
         )
 
-    callbacks.append(_done_language)
-    _button(screen, "DONE", 108, 140, 204, 44, _done_language, 0x225E45)
-    rtl_ready = (
-        rtl_firmware_abi == 2
-        and font_ar_source is not None
-        and font_ar_translation is not None
-        and font_he_source is not None
-        and font_he_translation is not None
-    )
-    note = "RTL firmware: OK" if rtl_ready else "Arabic/Hebrew need RTL firmware"
-    _label(screen, note, 8, 198, W - 16, FG_DIM, font_label)
+    callbacks.extend((_language_back, _language_forward))
+    _button(screen, "BACK", 0, 196, 112, 44, _language_back, FG_PANEL)
+    forward_text = "NEXT" if picker_slot == 0 else "DONE"
+    _button(screen, forward_text, 112, 196, 208, 44, _language_forward, 0x225E45)
     _load_screen(screen, callbacks)
 
 
@@ -1994,6 +1986,7 @@ def process_ui_action():
             settings_requested = True
         else:
             language_requested = True
+            picker_slot = 0
         if running:
             running = False
             stop_requested = True
@@ -2004,9 +1997,6 @@ def process_ui_action():
         else:
             language_requested = False
             language_page()
-    elif kind == "picker_slot":
-        picker_slot = action[1]
-        language_page()
     elif kind == "pick_language":
         pair = list(configured_pair())
         other = 1 - picker_slot
@@ -2014,9 +2004,24 @@ def process_ui_action():
             pair[other] = pair[picker_slot]
         pair[picker_slot] = action[1]
         CFG["language_pair"] = pair
-        picker_slot = other
         save_config()
         language_page()
+    elif kind == "language_back":
+        if picker_slot == 1:
+            picker_slot = 0
+            language_page()
+        else:
+            show_main_screen()
+            error = pair_render_error()
+            set_status(error if error else "Languages ready", FG_ALERT if error else FG_STATUS)
+    elif kind == "language_forward":
+        if picker_slot == 0:
+            picker_slot = 1
+            language_page()
+        else:
+            show_main_screen()
+            error = pair_render_error()
+            set_status(error if error else "Languages ready", FG_ALERT if error else FG_STATUS)
     elif kind == "setting":
         key, delta, lo, hi = action[1:]
         value = CFG[key] + delta
@@ -3390,6 +3395,19 @@ def renderable_text(text):
     return "".join(out) if changed else text
 
 
+def transcription_prompt():
+    pair = configured_pair()
+    return (
+        "Speech is in %s or %s. Transcribe verbatim in the original "
+        "language and writing system; do not translate. Context: %s."
+        % (
+            language_profile(pair[0])["name"],
+            language_profile(pair[1])["name"],
+            CFG["domain_context"],
+        )
+    )
+
+
 def transcribe(pcm):
     """Upload PCM as a multipart WAV. Returns (text, language_code_or_empty).
 
@@ -3398,24 +3416,12 @@ def transcribe(pcm):
     """
     model = CFG["transcribe_model"]
     fields = [("model", model), ("response_format", "json")]
-    pair = configured_pair()
     if model.startswith("gpt-4o-"):
-        fields.append(
-            (
-                "prompt",
-                "Speech is in %s or %s. Transcribe verbatim in the original "
-                "language and writing system; do not translate. Context: %s."
-                % (
-                    language_profile(pair[0])["name"],
-                    language_profile(pair[1])["name"],
-                    CFG["domain_context"],
-                ),
-            )
-        )
+        fields.append(("prompt", transcription_prompt()))
     if model == "gpt-transcribe":
         # These current fields are specific to gpt-transcribe; the faster mini
         # model rejects them and relies on automatic language detection.
-        for code in pair:
+        for code in configured_pair():
             fields.append(("languages[]", code))
         keywords = CFG.get("domain_keywords") or DEFAULT_DOMAIN_KEYWORDS
         if not isinstance(keywords, (list, tuple)):
@@ -3482,6 +3488,14 @@ def looks_hallucinated(text):
     while t and t[-1] in ".!?。！？":
         t = t[:-1]
     if not t:
+        return True
+    # gpt-4o-mini-transcribe can echo its entire conditioning prompt when
+    # quiet room audio barely clears the gate. Never display or translate the
+    # app's own instructions as if the user had spoken them.
+    prompt = ascii_lower(transcription_prompt().strip())
+    while prompt and prompt[-1] in ".!?。！？":
+        prompt = prompt[:-1]
+    if t == prompt:
         return True
     return any(ascii_lower(h) in t for h in HALLUCINATIONS)
 

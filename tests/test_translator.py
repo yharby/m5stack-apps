@@ -93,6 +93,7 @@ class TranslatorLanguageTests(unittest.TestCase):
         self.app["exit_requested"] = False
         self.app["stop_requested"] = False
         self.app["ui_action"] = None
+        self.app["picker_slot"] = 0
 
     def test_aliases_cover_supported_languages(self):
         normalize = self.app["normalize_language_code"]
@@ -206,6 +207,45 @@ class TranslatorLanguageTests(unittest.TestCase):
         self.app["font_trans_en"] = large
         self.assertIs(self.app["font_for_language"]("en", False), small)
         self.assertIs(self.app["font_for_language"]("en", True), large)
+
+    def test_language_picker_opens_on_source_then_advances_to_target(self):
+        painted = []
+        original = self.app["language_page"]
+        try:
+            self.app["language_page"] = lambda: painted.append(self.app["picker_slot"])
+            self.app["ui_action"] = ("languages",)
+            self.app["process_ui_action"]()
+            self.assertEqual(self.app["picker_slot"], 0)
+            self.assertEqual(painted, [0])
+
+            self.app["ui_action"] = ("language_forward",)
+            self.app["process_ui_action"]()
+            self.assertEqual(self.app["picker_slot"], 1)
+            self.assertEqual(painted, [0, 1])
+        finally:
+            self.app["language_page"] = original
+
+    def test_selecting_other_side_language_swaps_pair(self):
+        self.app["CFG"]["language_pair"] = ["en", "ar"]
+        self.app["picker_slot"] = 0
+        original_save = self.app["save_config"]
+        original_page = self.app["language_page"]
+        try:
+            self.app["save_config"] = lambda: None
+            self.app["language_page"] = lambda: None
+            self.app["ui_action"] = ("pick_language", "ar")
+            self.app["process_ui_action"]()
+            self.assertEqual(self.app["CFG"]["language_pair"], ["ar", "en"])
+            self.assertEqual(self.app["picker_slot"], 0)
+        finally:
+            self.app["save_config"] = original_save
+            self.app["language_page"] = original_page
+
+    def test_transcription_prompt_echo_is_rejected(self):
+        prompt = self.app["transcription_prompt"]()
+        self.assertEqual(len(prompt), 255)
+        self.assertTrue(self.app["looks_hallucinated"](prompt))
+        self.assertTrue(self.app["looks_hallucinated"](prompt[:-1]))
 
 
 class RenderableTextTest(unittest.TestCase):
