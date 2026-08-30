@@ -16,9 +16,13 @@ recovery, and the remaining verification work.
 > cases with `reset_cause()` still 1 (`PWRON_RESET`), where it previously
 > hard-reset within about 91 Arabic cases. Live translation then ran, and
 > exposed a third, cosmetic defect: the generated subsets stop at `U+007E`, so
-> typographic punctuation drew LVGL placeholder boxes. `renderable_text()` in
-> the app folds those onto ASCII. Do not call the Arabic path production-ready
-> until the final checklist in this document passes.
+> typographic punctuation drew LVGL placeholder boxes, and, larger, Cairo 3.130
+> carries no Arabic isolated forms at all, which is confirmed absent from the
+> source TTF rather than lost in generation. The app now folds punctuation onto
+> ASCII and proves the Arabic face against the isolated forms, substituting the
+> complete built-in face when it fails. Regenerating the Arabic subsets from a
+> typeface that has Presentation Forms-B is still owed. Do not call the Arabic
+> path production-ready until the final checklist in this document passes.
 
 ## Goal and architecture
 
@@ -642,11 +646,104 @@ override would fight the renderer rather than help it.
 parses all four generated subsets and asserts every replacement character is in
 each cmap, so the substitution table cannot drift away from the fonts.
 
+### The larger half: Cairo has no Arabic isolated forms
+
+Folding the punctuation removed some boxes but not most of them, and the reason
+was a mistake in how the first measurement was taken.
+
+**The host-side cmap parser was wrong.** It walked the `cmaps` array but treated
+every `FORMAT0`/`SPARSE` range as fully populated, ignoring the
+`glyph_id_ofs_list` entries of zero that mean "no glyph here". That overcounted
+Cairo's presentation-form coverage as 123 of 144 when the truth is 89. The
+correct method is to ask the running firmware, which
+[`rtl_glyph_probe.py`](../tools/device_scripts/rtl_glyph_probe.py) now does:
+
+```python
+found = font.get_glyph_dsc(font, dsc, code, 0)
+```
+
+Two details matter. The struct callback takes the font as its own first
+argument, and the answer is the **return value**. `dsc.is_placeholder` is set
+later by `lv_font_get_glyph_dsc_internal()` once the whole fallback chain has
+been tried, so it stays clear at this level. Testing `is_placeholder` here
+reports every code point as missing, including plain ASCII, which is how the
+first version of the probe produced an obviously impossible result.
+
+**What the device actually reports.** Measured against the 157 code points
+LVGL's `ap_chars_map` can emit:
+
+| Font | Shaping outputs drawable |
+|---|---|
+| `translator_cairo_16` / `_24` | 115 / 157 |
+| `font_dejavu_16_persian_hebrew` | 156 / 157, only `U+06EF` absent |
+
+The 42 Cairo is missing are `FE70-FE7F`, the tashkeel forms, and then a clean
+pattern:
+
+```
+FE80 FE81 FE83 FE85 FE87 FE89   isolated  ء آ أ ؤ إ ئ
+FE8D FE8F FE93 FE95 FE99 FE9D   isolated  ا ب ة ت ث ج
+FEA1 FEA5 FEA9 FEAB FEAD FEAF   isolated  ح خ د ذ ر ز
+FEB1 FEB5 FEB9 FEBD FEC1 FEC5   isolated  س ش ص ض ط ظ
+FEC9 FECD FED1 FED5 FED9 FEDD   isolated  ع غ ف ق ك ل
+FEE1 FEE5 FEE9 FEED FEEF FEF1   isolated  م ن ه و ى ي
+```
+
+Cairo ships every final, initial, and medial form and **not one isolated form**.
+Isolated position is constant in Arabic: every word-initial alef, every
+standalone waw, every letter following a non-joining one. That is the scatter of
+boxes through otherwise correct text.
+
+**Confirmed at the source, not inferred.** Reading the TTF directly with
+`fontTools` shows the glyphs were never there to extract:
+
+```
+Cairo-3.130.ttf   isolated forms in cmap: 0/36
+                  final forms in cmap:    9/9
+```
+
+So this is not `lv_font_conv` and not the generator range. Regenerating from
+Cairo with any range cannot fix it.
+
+### Why the fix is not in the LVGL fork
+
+LVGL is behaving correctly. It maps each letter to the positional form the
+context calls for, and the isolated form is the right request. The defect is
+entirely in the font asset. The fork carries only the BiDi bounds fix and should
+not grow a workaround for this.
+
+Nor can it be fixed at runtime. `lv_font_t.fallback` is exactly the mechanism
+for filling gaps from another face, but the generated fonts are
+`const lv_font_t` in flash, so assigning `.fallback` from MicroPython stores to
+read-only memory and hard-resets the board. That was verified, twice. The
+fallback must be set at build time, or a complete face chosen instead.
+
+### The fix that shipped, and the one still owed
+
+The app now proves the configured Arabic faces instead of trusting them.
+`font_covers()` asks for the isolated forms of alef, lam, meem, waw, yeh, and
+teh, and if the configured face fails, substitutes
+`font_dejavu_16_persian_hebrew` and logs the substitution. Arabic becomes
+legible at the cost of a single 16 px size and a plainer face, which is better
+than a line of boxes. The check is a property of the font, not a hardcoded
+choice, so when the firmware ships a complete Arabic face it stops substituting
+on its own.
+
+Still owed, at the next firmware build: regenerate the 16 and 24 px Arabic
+subsets from a typeface that carries Arabic Presentation Forms-B, such as Amiri
+or Scheherazade New, and require `rtl_glyph_probe.py` to report full shaping
+coverage before flashing.
+
 ### Lesson
 
-A generator range is an intent. Verify coverage from the generated cmap, not
-from the command line that produced it, and treat any placeholder box as a
+A generator range is an intent, and a host-side parse of the artifact is a
+second-hand account. Ask the device. Then treat any placeholder box as a
 precise, decodable statement about one missing code point.
+
+Coverage of a script block is not coverage of a script. When the renderer
+rewrites text before drawing it, as LVGL does for Arabic, the only meaningful
+question is whether the face can supply what the renderer will actually ask
+for.
 
 ## Device probes and expected output
 
@@ -780,9 +877,13 @@ record.
       draws nothing and hard-resets the board.
 - [ ] Each font is proven by *rendering* a shaped two-character Arabic and
       Hebrew string, not merely by the symbol being present.
-- [ ] Font coverage is read from the generated `cmaps` array, not from the
-      generator range, and `make check` passes so every `renderable_text()`
-      substitution target is confirmed present in all four subsets.
+- [ ] Font coverage is read from the device with `rtl_glyph_probe.py`, never
+      from the generator range or a host-side parse of the `.c` file, and
+      `make check` passes so every `renderable_text()` substitution target is
+      confirmed present in all four subsets.
+- [ ] The Arabic faces supply all 36 isolated presentation forms. Cairo 3.130
+      supplies none of them, so a build still using it will substitute
+      `font_dejavu_16_persian_hebrew` and log that it did.
 - [ ] A live translation is read on screen for placeholder boxes. Each box is
       one missing code point; decode it rather than guessing.
 - [ ] Arabic/Hebrew render stress probe passes repeatedly without reset or

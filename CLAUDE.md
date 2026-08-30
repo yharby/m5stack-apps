@@ -109,9 +109,30 @@ plain `mpremote connect`, and do not compete with the UIFlow2 web IDE or a
   sets `box_w` to half the line height and draws a rectangle. Each box is
   exactly one code point absent from the subset.
 - A `lv_font_conv` range is a request. It emits only glyphs the source TTF
-  holds, so read real coverage from the generated `cmaps` array. The shipped
+  holds, so never infer coverage from the generator arguments. The shipped
   subsets cover `0x20-0x7E` and their script block only, so typographic
   punctuation must be folded onto ASCII in Python before it reaches a label.
+- Read coverage from the device, not from the generated `.c` file. A host-side
+  cmap parser must honour the `glyph_id_ofs_list` zero entries in a
+  `FORMAT0_FULL`/`SPARSE_FULL` cmap, which mean "no glyph"; ignoring them
+  overcounts coverage badly. `tools/device_scripts/rtl_glyph_probe.py` asks the
+  running firmware instead and is the authority.
+- Query a glyph with `font.get_glyph_dsc(font, dsc, code, 0)`. The struct
+  callback takes the font as its own first argument, and the answer is the
+  return value. `dsc.is_placeholder` is set later by
+  `lv_font_get_glyph_dsc_internal()` after the fallback chain is exhausted, so
+  it stays clear here and must not be used as the test.
+- LVGL rewrites Arabic to presentation forms before drawing, so covering
+  `0x600-0x6FF` does not mean a face can draw Arabic. Cairo 3.130 carries every
+  final, initial, and medial form but **none of the 36 isolated forms**, and
+  isolated position is constant in Arabic. Widening the range cannot fix it
+  because the glyphs are absent from the source TTF. Verify an Arabic face
+  against the isolated forms of alef, lam, meem, waw, yeh, and teh
+  (`FE8D FEDD FEE1 FEED FEF1 FE95`). `font_dejavu_16_persian_hebrew` covers
+  156/157 shaping outputs and is the safe substitute.
+- The `lv_font_t.fallback` chain cannot be repaired at runtime. Generated fonts
+  are `const lv_font_t` in flash, so assigning `.fallback` from MicroPython
+  faults and hard-resets the board. Set it at build time or pick another face.
 - Direct-canvas apps should use `textWidth()` for wrapping mixed Latin/CJK.
 - `newCanvas(..., bpp=16, psram=True)` is verified for flicker-free regions.
 - LCD and SD share SPI pins. Finish drawing before SD I/O and keep writes short.
