@@ -1,102 +1,120 @@
-# CoreS3 Geo Translator
+# M5Stack Apps
 
-Pocket English ↔ Japanese interpretation for FOSS4G and open-geospatial
-conversations, running on an M5Stack CoreS3.
+My registry of custom apps, utilities, and hardware experiments for M5Stack
+devices. The current apps target the CoreS3 running UIFlow2 MicroPython and can
+be installed directly into its `APP.LIST` menu.
 
-```text
-CoreS3 mics → 1 s frames → pause detection → transcription → translation → LCD
-                    listening continues during both API calls
-```
+## App registry
 
-## Highlights
+| App | What it does | Hardware | Configuration |
+|---|---|---|---|
+| [`wifi_qr`](device/apps/wifi_qr.py) | Scans a standard Wi-Fi QR code and safely switches UIFlow2's saved network | Camera, touch | None |
+| [`translator`](device/apps/translator.py) | Realtime English ↔ Japanese speech translation for FOSS4G and geospatial conversations | Microphones, display, touch, Wi-Fi | OpenAI API key |
 
-- Speech is cut on a natural pause, not on a wall clock, so a short sentence
-  turns around as soon as the talker stops instead of waiting out a fixed slice
-- One keep-alive TLS connection is reused for every API call in a session,
-  removing two handshakes per turn
-- Capture keeps running during both API calls, pumped from the same loop that
-  services touch
-- Open-geospatial recognition for FOSS4G, OSGeo, STAC, OGC API, GeoParquet,
-  GeoServer, MapLibre, GeoZarr, and related terminology
-- English ↔ Japanese direction inferred from the transcript itself
-- Flicker-free canvas rendering with adaptive EN/JA text layout
-- Live two-channel meters with adjustable gate, utterance ceiling, and mic gain
-- UIFlow2 MicroPython app with a small host-side USB development CLI
+Both apps are production-tested on an M5Stack CoreS3 with UIFlow2 `2.5.1` and
+MicroPython `1.27.0`. Compatibility with other M5Stack models is not assumed;
+each app's hardware requirements are listed above.
 
-## Measured on device
+## Quick start
 
-With continuous speech and a 7 s ceiling, against the previous fixed-slice and
-`requests2` build:
-
-| Stage | Before | After |
-|---|---|---|
-| Transcription | 2.0 to 2.9 s | 1.75 to 1.94 s |
-| Translation | 2.7 to 3.4 s | 1.7 to 2.5 s |
-| Pipeline total | ~5.2 s | ~3.7 s |
-
-The old build also left the microphone idle about 1.2 s of every cycle, losing
-roughly 15 percent of speech. Conversational audio with real pauses benefits
-further, because the endpointer then fires well before the ceiling.
-
-## Setup
-
-Requires an M5Stack CoreS3 running UIFlow2 `2.5.1`, Python 3.11+, and
-[`uv`](https://docs.astral.sh/uv/).
+Requires Python 3.11+ and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
 make setup
-cp device/config.example.json device/config.json
-# Add the OpenAI credential to device/config.json, then place the private
-# config at /flash/res/config.json on the device. Wi-Fi fields are optional
-# fallbacks; the translator normally follows UIFlow2's current network.
-make push
-make run
+make info
+make push APP=wifi_qr
+make push APP=translator
 ```
 
-## Wi-Fi QR setup app
-
-`device/apps/wifi_qr.py` uses the CoreS3's built-in camera to scan a standard
-Wi-Fi QR code (`WIFI:T:WPA;S:network;P:password;;`) and connect to it. Successful
-credentials are saved only in UIFlow2's own NVS settings, so its launcher uses
-the new network after the app exits or the device reboots. The QR password is
-never displayed or written to an extra plaintext file.
-
-The translator reads those UIFlow2 settings every time it needs to reconnect.
-It lets UIFlow2 finish any connection already started during boot, prefers the
-current UIFlow2 network, and only tries `config.json` Wi-Fi credentials as a
-fallback. This means switching networks with the QR app does not require
-editing or reinstalling the translator.
+Installed files go to `/flash/apps/<name>.py`, where UIFlow2 exposes them in
+`APP.LIST`. To run without installing, or to make one app the boot app:
 
 ```bash
-make push APP=wifi_qr       # install it in APP.LIST
-make run APP=wifi_qr        # run it over USB for development
+make run APP=wifi_qr
+make run APP=translator
+make autorun APP=translator
 ```
 
-The camera starts immediately. Confirm the detected SSID with **CONNECT** or
-cancel without changing networks. After connecting, use **SCAN AGAIN** for a
-different network or **EXIT** to reboot into the UIFlow2 launcher. The power
-button exits from any screen. CoreS3 supports 2.4 GHz Wi-Fi, not 5 GHz-only
-networks.
+`make run` streams serial output until interrupted. `make autorun` also writes
+the selected app to `/flash/main.py`; use it only for the app you want launched
+by UIFlow2's boot mode.
+
+## Wi-Fi QR
+
+The CoreS3 camera starts immediately and recognizes the standard format:
+
+```text
+WIFI:T:WPA;S:network;P:password;;
+```
+
+The app validates the payload, shows the SSID and security type, and requires
+confirmation before changing anything. It tests the new connection, restores
+the previous network after a failure, and only then saves the credentials to
+UIFlow2's own NVS settings. Passwords are never displayed, logged, or copied to
+an extra plaintext file.
+
+After connecting, choose **SCAN AGAIN** or **EXIT**. EXIT and the power button
+clean up the camera and reboot into the UIFlow2 launcher. CoreS3 Wi-Fi is
+2.4 GHz; a 5 GHz-only network cannot be used.
+
+## Geo Translator
+
+The translator provides pocket English ↔ Japanese interpretation optimized for
+FOSS4G and open-geospatial terminology:
+
+```text
+CoreS3 mics → pause detection → transcription → translation → LCD
+                    capture continues during both API calls
+```
+
+It uses natural-pause endpointing, a reusable HTTP/1.1 TLS connection,
+continuous microphone capture, automatic language direction, and flicker-free
+EN/JA rendering. On the tested device, the optimized pipeline completed in
+about 3.7 seconds compared with roughly 5.2 seconds for the original fixed-slice
+implementation.
+
+Copy the example configuration, add the OpenAI credential, and place the
+private file at `/flash/res/config.json`:
+
+```bash
+cp device/config.example.json device/config.json
+```
+
+Wi-Fi fields in that file are optional fallbacks. The translator normally uses
+the network currently selected by UIFlow2—including one selected by
+`wifi_qr`—and re-reads those settings whenever it needs to reconnect.
 
 Tap the screen to start or pause. Tap the gear for microphone meters and
-sensitivity controls, where `Chunk` sets the longest an utterance can run
-before it is sent regardless of pauses.
+sensitivity controls. `Chunk` is the maximum utterance length when no natural
+pause occurs.
 
-Useful commands:
+## Development workflow
 
 ```bash
-make info       # inspect the connected board
-make selftest   # mic + network + API end-to-end test
-make logs       # read /flash/translator.log
-make check      # formatting and lint
+make catalog                 # list apps in this repository
+make apps                    # list apps installed on the device
+make info                    # firmware, memory, and connection details
+make push APP=<name>         # install one registry app
+make run APP=<name>          # run source live over USB
+make autorun APP=<name>      # install the selected app as /flash/main.py
+make rm-app APP=<name>       # remove one installed app
+make probe                   # display, microphone, config, and Wi-Fi smoke test
+make selftest                # translator network/mic/OpenAI end-to-end test
+make logs                    # read /flash/translator.log
+make reset                   # reboot into UIFlow2
+make check                   # formatting and lint
 ```
 
-## Configuration
+To add an app, place one self-contained MicroPython file in `device/apps/`.
+Keep credentials out of source control, document any model-specific hardware,
+and verify both live execution and `APP.LIST` installation on the real device.
+
+## Configuration and safety
 
 The committed [example configuration](device/config.example.json) contains no
-credentials. Real secrets belong only in `/flash/res/config.json` and are
-ignored by Git. The geospatial context and recognition keywords are also
-configurable there.
+real credentials. `.gitignore` excludes `config.json`, keys, logs, virtual
+environments, and Python caches.
 
-See [CLAUDE.md](CLAUDE.md) for verified CoreS3/UIFlow2 implementation notes
-and hardware-specific debugging details.
+[CLAUDE.md](CLAUDE.md) is the durable engineering reference for the shared
+CoreS3/UIFlow2 behavior and app-specific findings. [HANDOVER.md](HANDOVER.md)
+contains the Translator performance handover.

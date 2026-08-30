@@ -312,7 +312,7 @@ wheels = [
 ]
 
 [[package]]
-name = "m5stack-translator"
+name = "m5stack-apps"
 version = "0.1.0"
 source = { virtual = "." }
 

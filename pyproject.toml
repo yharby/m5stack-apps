@@ -1,7 +1,7 @@
 [project]
-name = "m5stack-translator"
+name = "m5stack-apps"
 version = "0.1.0"
-description = "Realtime EN<->JA speech translator for M5Stack CoreS3 (UIFlow2 MicroPython)"
+description = "Personal registry of UIFlow2 MicroPython apps for M5Stack devices"
 requires-python = ">=3.11"
 dependencies = []
 

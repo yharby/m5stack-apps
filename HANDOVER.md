@@ -1,7 +1,11 @@
-# Handover, M5Stack CoreS3 translator
+# Translator app performance handover
+
+This document is specific to `device/apps/translator.py` in the broader
+M5Stack Apps registry. Repository-wide workflow and platform facts live in
+`README.md` and `CLAUDE.md`.
 
 Updated 2026-08-28 after a latency and smoothness pass. Read `CLAUDE.md`
-first, its FACTS section is the durable reference and it now contains
+first; its verified platform facts are the durable reference and include
 corrected entries that contradict earlier notes.
 
 ## Current status: working, measurably faster

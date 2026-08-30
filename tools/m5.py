@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Device control CLI for the M5Stack CoreS3 running UIFlow2 MicroPython.
+"""Device control CLI for the M5Stack UIFlow2 app registry.
 
 The one non-obvious thing this handles: UIFlow2 boots into an asyncio launcher
 that owns the serial REPL, so a plain `mpremote` connect fails with

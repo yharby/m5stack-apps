@@ -1,4 +1,4 @@
-# M5Stack CoreS3 translator - dev commands
+# M5Stack UIFlow2 app registry - shared development commands
 #
 # All device access goes through tools/m5.py, which first breaks into the
 # MicroPython REPL (UIFlow2 boots an asyncio launcher that owns the serial
@@ -10,7 +10,7 @@
 M5  := uv run python tools/m5.py
 APP ?= translator
 
-.PHONY: help setup info ls apps push autorun rm-app run selftest probe \
+.PHONY: help setup catalog info ls apps push autorun rm-app run selftest probe \
         repl reset logs clear-logs lint format check
 
 help:
@@ -18,6 +18,9 @@ help:
 
 setup:      ## install dev tooling into .venv
 	uv sync
+
+catalog:    ## list apps available in this repository
+	@for app in device/apps/*.py; do basename "$$app" .py; done
 
 info:       ## show port, firmware, memory, board info
 	@$(M5) info
@@ -28,7 +31,7 @@ ls:         ## list the whole device filesystem
 apps:       ## list apps installed on the device
 	@$(M5) apps
 
-push:       ## install app to /flash/apps/<name>.py        (APP=translator)
+push:       ## install app to /flash/apps/<name>.py        (APP=name)
 	@$(M5) push $(APP)
 
 autorun:    ## also install app as /flash/main.py (runs on boot)
@@ -37,10 +40,10 @@ autorun:    ## also install app as /flash/main.py (runs on boot)
 rm-app:     ## delete an app from the device               (APP=name)
 	@$(M5) rm-app $(APP)
 
-run:        ## run app live, streaming its output here     (APP=translator)
+run:        ## run app live, streaming its output here     (APP=name)
 	@$(M5) run $(APP)
 
-selftest:   ## on-device end-to-end check: config, wifi, mic, OpenAI
+selftest:   ## translator end-to-end check: config, wifi, mic, OpenAI
 	@$(M5) selftest
 
 probe:      ## hardware smoke test (config, wifi, display, mic)
@@ -52,7 +55,7 @@ repl:       ## interactive MicroPython REPL (Ctrl-] to exit)
 reset:      ## reboot the device back into UIFlow2
 	@$(M5) reset
 
-logs:       ## print the on-device app log                 (make logs n=100)
+logs:       ## print the translator log                    (make logs n=100)
 	@$(M5) logs -n $(or $(n),40)
 
 clear-logs: ## delete the on-device app log
