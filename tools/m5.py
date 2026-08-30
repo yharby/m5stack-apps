@@ -24,6 +24,8 @@ APPS_DIR = "device/apps"  # host-side source of truth, one file per app
 REMOTE_APPS = "/flash/apps"  # what the device APP.LIST menu shows
 REMOTE_AUTORUN = "/flash/main.py"  # what the device runs on boot / APP.RUN
 DEFAULT_APP = "translator"
+LOCAL_CONFIG = "device/config.json"
+REMOTE_CONFIG = "/flash/res/config.json"
 REMOTE_LOG = "/flash/translator.log"
 SELFTEST = "tools/device_scripts/selftest.py"
 SD_PROBE = "tools/device_scripts/sd_probe.py"
@@ -94,9 +96,12 @@ def cmd_info(port: str, _args) -> int:
     print(f"port: {port}")
     return remote_exec(
         port,
-        "import sys, os, gc, M5\n"
+        "import sys, os, gc, machine, M5\n"
         "print('micropython:', sys.version)\n"
         "print('platform:', sys.platform)\n"
+        "print('reset cause:', machine.reset_cause())\n"
+        "print('reset constants:', [(n, getattr(machine, n, None)) for n in "
+        "('PWRON_RESET','HARD_RESET','WDT_RESET','DEEPSLEEP_RESET','SOFT_RESET')])\n"
         "try:\n"
         "    import esp32; print('uiflow:', esp32.firmware_info()[3])\n"
         "except Exception as e: print('uiflow: ?', e)\n"
@@ -139,6 +144,48 @@ def cmd_push(port: str, args) -> int:
     breakin(port)
     print(f"[m5] {src} -> {dest}")
     return mp(port, "cp", src, ":" + dest).returncode
+
+
+def cmd_push_config(port: str, _args) -> int:
+    """Validate and atomically replace Translator's private device config."""
+    import json
+    from pathlib import Path
+
+    source = Path(LOCAL_CONFIG)
+    try:
+        config = json.loads(source.read_text())
+    except Exception as error:
+        sys.exit(f"Invalid {LOCAL_CONFIG}: {error}")
+    if not isinstance(config, dict) or not config.get("openai_api_key"):
+        sys.exit(f"{LOCAL_CONFIG} must be a JSON object with openai_api_key")
+
+    temporary = REMOTE_CONFIG + ".new"
+    backup = REMOTE_CONFIG + ".bak"
+    breakin(port)
+    print(f"[m5] {LOCAL_CONFIG} -> {REMOTE_CONFIG} (validated; secrets hidden)")
+    copied = mp(port, "cp", LOCAL_CONFIG, ":" + temporary)
+    if copied.returncode:
+        return copied.returncode
+    code = (
+        "import json, os\n"
+        f"new={temporary!r}; dst={REMOTE_CONFIG!r}; bak={backup!r}\n"
+        "f=open(new); cfg=json.loads(f.read()); f.close()\n"
+        "assert isinstance(cfg, dict) and cfg.get('openai_api_key')\n"
+        "try: os.remove(bak)\n"
+        "except OSError: pass\n"
+        "try: os.rename(dst, bak)\n"
+        "except OSError: pass\n"
+        "try:\n"
+        "    os.rename(new, dst)\n"
+        "except Exception:\n"
+        "    try: os.rename(bak, dst)\n"
+        "    except OSError: pass\n"
+        "    raise\n"
+        "print('config installed:', dst)\n"
+        "print('pair:', cfg.get('language_pair'), 'mode:', cfg.get('source_mode'), "
+        "'history:', cfg.get('history_turns'))\n"
+    )
+    return remote_exec(port, code).returncode
 
 
 def cmd_autorun(port: str, args) -> int:
@@ -280,6 +327,7 @@ COMMANDS = {
     "cat": cmd_cat,
     "apps": cmd_apps,
     "push": cmd_push,
+    "push-config": cmd_push_config,
     "autorun": cmd_autorun,
     "rm-app": cmd_rm_app,
     "run": cmd_run,
