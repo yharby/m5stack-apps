@@ -137,6 +137,12 @@ LOG_PATH = "/flash/translator.log"
 LOG_MAX_BYTES = 64 * 1024
 LOG_ROTATE_EVERY = 200
 HTTP_TIMEOUT = 45
+WIFI_BOOT_SETTLE_MS = 12000
+WIFI_IDLE_GRACE_MS = 1500
+WIFI_ATTEMPT_TIMEOUT_MS = 15000
+WIFI_CREDENTIAL_GRACE_MS = 750
+WIFI_TRANSIENT_GRACE_MS = 2000
+WIFI_ATTEMPTS_PER_NETWORK = 3
 # Measured on this unit with tools/device_scripts/thread_probe.py: a 32 KB
 # task stack CANNOT be created here and raises OSError("can't create
 # thread") every time, which silently sent every POST down do_post's
@@ -352,10 +358,11 @@ def save_config():
 
 
 _wifi_tuned = False
+_wifi_boot_checked = False
 
 
-def tune_wifi(w):
-    """Turn off modem power save, once per boot.
+def tune_wifi(w, force=False):
+    """Turn off modem power save after activation and radio resets.
 
     Power save parks the radio between DTIM beacons, which adds latency and
     jitter to every API round trip. This app does short interactive sessions,
@@ -365,7 +372,7 @@ def tune_wifi(w):
     """
     global _wifi_tuned
 
-    if _wifi_tuned:
+    if _wifi_tuned and not force:
         return
     _wifi_tuned = True
     for key, value in (("pm", getattr(network.WLAN, "PM_NONE", 0)), ("ps_mode", 0)):
@@ -378,36 +385,215 @@ def tune_wifi(w):
     log("wifi: power save unchanged, no supported config key")
 
 
-def ensure_wifi():
-    """Return True when the station interface is associated.
+def wifi_status_name(status):
+    names = (
+        (getattr(network, "STAT_IDLE", 1000), "idle"),
+        (getattr(network, "STAT_CONNECTING", 1001), "connecting"),
+        (getattr(network, "STAT_GOT_IP", 1010), "got-ip"),
+        (getattr(network, "STAT_NO_AP_FOUND", 201), "no-ap"),
+        (
+            getattr(network, "STAT_NO_AP_FOUND_IN_RSSI_THRESHOLD", -101),
+            "no-ap-rssi",
+        ),
+        (
+            getattr(network, "STAT_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD", -102),
+            "no-ap-auth",
+        ),
+        (
+            getattr(network, "STAT_NO_AP_FOUND_W_COMPATIBLE_SECURITY", -103),
+            "no-compatible-security",
+        ),
+        (getattr(network, "STAT_WRONG_PASSWORD", 202), "wrong-password"),
+        (getattr(network, "STAT_ASSOC_FAIL", 203), "association-failed"),
+        (getattr(network, "STAT_HANDSHAKE_TIMEOUT", 204), "handshake-timeout"),
+        (getattr(network, "STAT_BEACON_TIMEOUT", -104), "beacon-timeout"),
+    )
+    for value, name in names:
+        if status == value:
+            return name
+    return str(status)
 
-    Called at boot and again before each session. The fast path is a single
-    isconnected() check, so the per-session cost is negligible, and it turns a
-    dropped link into an immediate message instead of a 45 second HTTP timeout.
+
+def wifi_attempt_terminal_statuses():
+    """Statuses that require a new connect() call to make progress."""
+    return (
+        getattr(network, "STAT_NO_AP_FOUND", 201),
+        getattr(network, "STAT_NO_AP_FOUND_IN_RSSI_THRESHOLD", -101),
+        getattr(network, "STAT_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD", -102),
+        getattr(network, "STAT_NO_AP_FOUND_W_COMPATIBLE_SECURITY", -103),
+        getattr(network, "STAT_WRONG_PASSWORD", 202),
+        getattr(network, "STAT_ASSOC_FAIL", 203),
+        getattr(network, "STAT_HANDSHAKE_TIMEOUT", 204),
+        getattr(network, "STAT_BEACON_TIMEOUT", -104),
+    )
+
+
+def wifi_nonretryable_statuses():
+    """Statuses that cannot improve without changing the credentials."""
+    return (
+        getattr(network, "STAT_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD", -102),
+        getattr(network, "STAT_NO_AP_FOUND_W_COMPATIBLE_SECURITY", -103),
+        getattr(network, "STAT_WRONG_PASSWORD", 202),
+    )
+
+
+def wait_for_wifi(w, timeout_ms, accept_terminal=True):
+    """Pump UI events until Wi-Fi connects, fails terminally, or times out."""
+    deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
+    terminal_at = None
+    last_status = None
+    terminals = wifi_attempt_terminal_statuses()
+    nonretryable = wifi_nonretryable_statuses()
+
+    while not w.isconnected():
+        M5.update()
+        status = w.status()
+        if status != last_status:
+            log("wifi: status=%s" % wifi_status_name(status))
+            last_status = status
+            terminal_at = time.ticks_ms() if status in terminals else None
+        elif accept_terminal and terminal_at is not None:
+            grace_ms = (
+                WIFI_CREDENTIAL_GRACE_MS if status in nonretryable else WIFI_TRANSIENT_GRACE_MS
+            )
+            if time.ticks_diff(time.ticks_ms(), terminal_at) >= grace_ms:
+                return False
+        if time.ticks_diff(deadline, time.ticks_ms()) < 0:
+            return False
+        time.sleep_ms(100)
+    return True
+
+
+def uiflow_wifi_credentials():
+    """Read the network selected by UIFlow2 Settings or the Wi-Fi QR app."""
+    try:
+        import esp32
+
+        settings = esp32.NVS("uiflow")
+        try:
+            net_mode = settings.get_str("net_mode")
+        except OSError:
+            net_mode = "WIFI"
+        if net_mode and net_mode != "WIFI":
+            log("wifi: UIFlow2 network mode is %r, skipping its Wi-Fi credentials" % net_mode)
+            return None
+        try:
+            ssid = settings.get_str("ssid0")
+        except OSError:
+            ssid = ""
+        try:
+            password = settings.get_str("pswd0")
+        except OSError:
+            password = ""
+        if ssid:
+            return ssid, password
+    except Exception as e:
+        log("wifi: could not read UIFlow2 settings: %r" % e)
+    return None
+
+
+def wifi_candidates():
+    """Return unique (source, ssid, password) candidates in priority order."""
+    candidates = []
+    uiflow = uiflow_wifi_credentials()
+    if uiflow is not None:
+        candidates.append(("UIFlow2", uiflow[0], uiflow[1]))
+
+    config_ssid = CFG["wifi_ssid"]
+    config_password = CFG["wifi_pass"]
+    if config_ssid:
+        duplicate = False
+        for _source, ssid, password in candidates:
+            if ssid == config_ssid and password == config_password:
+                duplicate = True
+                break
+        if not duplicate:
+            candidates.append(("config", config_ssid, config_password))
+    return candidates
+
+
+def reset_wifi_station(w):
+    try:
+        w.disconnect()
+    except Exception:
+        pass
+    w.active(False)
+    time.sleep_ms(300)
+    w.active(True)
+    time.sleep_ms(500)
+    tune_wifi(w, force=True)
+
+
+def connect_wifi_candidate(w, source, ssid, password):
+    """Try one saved network with real asynchronous retries."""
+    for attempt in range(1, WIFI_ATTEMPTS_PER_NETWORK + 1):
+        reset_wifi_station(w)
+        log(
+            "wifi: connecting source=%s ssid=%r attempt=%d/%d"
+            % (source, ssid, attempt, WIFI_ATTEMPTS_PER_NETWORK)
+        )
+        try:
+            if password:
+                w.connect(ssid, password)
+            else:
+                w.connect(ssid)
+        except Exception as e:
+            log("wifi: connect call failed source=%s error=%r" % (source, e))
+            continue
+
+        if wait_for_wifi(w, WIFI_ATTEMPT_TIMEOUT_MS):
+            log("wifi: connected source=%s ssid=%r ip=%s" % (source, ssid, w.ifconfig()[0]))
+            return True
+
+        status = w.status()
+        if status in wifi_nonretryable_statuses():
+            log("wifi: not retrying source=%s status=%s" % (source, wifi_status_name(status)))
+            break
+        if attempt < WIFI_ATTEMPTS_PER_NETWORK:
+            backoff_ms = attempt * 1000
+            log("wifi: transient failure, retrying in %d ms" % backoff_ms)
+            time.sleep_ms(backoff_ms)
+    return False
+
+
+def ensure_wifi():
+    """Prefer UIFlow2's live/dynamic network, with JSON as a fallback.
+
+    UIFlow2 starts association in boot.py and immediately launches main.py.
+    The first call therefore waits for that in-flight connection instead of
+    interrupting it with the translator's older JSON credentials. Later calls
+    retain the cheap isconnected() fast path and re-read NVS after a QR switch.
     """
+    global _wifi_boot_checked
+
     w = network.WLAN(network.STA_IF)
     w.active(True)
     tune_wifi(w)
     if w.isconnected():
         return True
-    if not CFG["wifi_ssid"]:
-        log("wifi: down and no ssid configured")
+
+    if not _wifi_boot_checked:
+        _wifi_boot_checked = True
+        status = w.status()
+        connecting = getattr(network, "STAT_CONNECTING", 1001)
+        idle = getattr(network, "STAT_IDLE", 1000)
+        if status in (connecting, idle):
+            settle_ms = WIFI_BOOT_SETTLE_MS if status == connecting else WIFI_IDLE_GRACE_MS
+            log("wifi: allowing UIFlow2's boot connection to settle")
+            if wait_for_wifi(w, settle_ms):
+                log("wifi: UIFlow2 boot connection ready ip=%s" % w.ifconfig()[0])
+                return True
+
+    candidates = wifi_candidates()
+    if not candidates:
+        log("wifi: down and no UIFlow2 or config credentials available")
         return False
-    log("wifi: connecting to %s" % CFG["wifi_ssid"])
-    try:
-        w.connect(CFG["wifi_ssid"], CFG["wifi_pass"])
-    except Exception as e:
-        log("wifi: connect failed %r" % e)
-        return False
-    deadline = time.ticks_add(time.ticks_ms(), 20000)
-    while not w.isconnected():
-        M5.update()
-        if time.ticks_diff(deadline, time.ticks_ms()) < 0:
-            log("wifi: timeout, status=%s" % w.status())
-            return False
-        time.sleep_ms(300)
-    log("wifi: connected ip=%s" % w.ifconfig()[0])
-    return True
+
+    for source, ssid, password in candidates:
+        if connect_wifi_candidate(w, source, ssid, password):
+            return True
+    log("wifi: all configured networks failed")
+    return False
 
 
 # ------------------------------------------------------------------ levels
@@ -2580,8 +2766,12 @@ def setup():
 
     # Join at boot rather than lazily on the first POST. A dead link should
     # say so on screen, not surface later as an opaque 45 second timeout.
-    set_status("Connecting Wi-Fi...")
+    set_status("Checking Wi-Fi...")
     online = ensure_wifi()
+    if online:
+        set_status("Wi-Fi connected")
+    else:
+        set_status("Wi-Fi unavailable", FG_ALERT)
 
     probe_channels()
 
@@ -2589,6 +2779,7 @@ def setup():
     # screen. The first POST after boot otherwise pays DNS plus a full cold
     # handshake, which was measured at about 33 seconds on this board.
     if online:
+        set_status("Connecting to API...")
         prewarm()
 
     update_display()

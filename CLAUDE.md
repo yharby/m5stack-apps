@@ -14,7 +14,7 @@ talks to OpenAI at the same time.
 | Mics | two real MEMS mics, U12 on ES7210 ch1 and U13 on ch2 |
 | Firmware | UIFlow2 V2.5.1, MicroPython v1.27.0 |
 | Serial port | `/dev/cu.usbmodem*` (autodetected) |
-| Wi-Fi | configured on device, joins automatically |
+| Wi-Fi | UIFlow2 NVS is authoritative; JSON credentials are fallback only |
 
 ## Layout
 
@@ -66,6 +66,20 @@ reading the `uiflow_micropython` tag `2.5.1` source (commit `96c8a6e2`), plus
 M5Unified, M5GFX and the official CoreS3 schematic. **Do not "fix" any of it
 back to what the docs suggest without re-probing.** Several of these were
 found the hard way, by hanging the board.
+
+## Wi-Fi ownership and startup
+
+UIFlow2 2.5.1 stores its active station credentials in the `uiflow` NVS
+namespace under `ssid0` and `pswd0`, with `net_mode` set to `WIFI`. Its
+`boot.py` begins association asynchronously and can launch `main.py` while
+that connection is still in progress. The translator must let that attempt
+settle before calling `WLAN.connect()` itself; otherwise an old
+`config.json` SSID can interrupt the newly selected UIFlow2 network.
+
+`ensure_wifi()` therefore uses an already-connected station first, waits for
+UIFlow2's initial attempt, then re-reads NVS and tries that network before the
+optional JSON fallback. Do not add a preflight scan: an iPhone hotspot on this
+device has connected successfully even when it was absent from scan results.
 
 ## Recovering a wedged board
 

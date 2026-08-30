@@ -33,12 +33,58 @@ if not key:
 
 w = network.WLAN(network.STA_IF)
 w.active(True)
-if not w.isconnected() and CFG.get("wifi_ssid"):
-    w.connect(CFG["wifi_ssid"], CFG.get("wifi_pass", ""))
-    for _ in range(60):
+wifi_candidates = []
+try:
+    import esp32
+
+    settings = esp32.NVS("uiflow")
+    try:
+        net_mode = settings.get_str("net_mode")
+    except OSError:
+        net_mode = "WIFI"
+    if not net_mode or net_mode == "WIFI":
+        try:
+            ui_ssid = settings.get_str("ssid0")
+        except OSError:
+            ui_ssid = ""
+        try:
+            ui_password = settings.get_str("pswd0")
+        except OSError:
+            ui_password = ""
+        if ui_ssid:
+            wifi_candidates.append(("UIFlow2", ui_ssid, ui_password))
+except Exception as e:
+    print("wifi: could not read UIFlow2 settings:", repr(e))
+
+config_ssid = CFG.get("wifi_ssid", "")
+config_password = CFG.get("wifi_pass", "")
+if config_ssid and not any(
+    ssid == config_ssid and password == config_password
+    for _source, ssid, password in wifi_candidates
+):
+    wifi_candidates.append(("config", config_ssid, config_password))
+
+if not w.isconnected():
+    for source, ssid, password in wifi_candidates:
+        print("wifi: trying", source, repr(ssid))
+        try:
+            w.disconnect()
+        except Exception:
+            pass
+        try:
+            if password:
+                w.connect(ssid, password)
+            else:
+                w.connect(ssid)
+        except Exception as e:
+            print("wifi: connect call failed:", repr(e))
+            continue
+        for _ in range(60):
+            if w.isconnected():
+                break
+            time.sleep_ms(300)
         if w.isconnected():
             break
-        time.sleep_ms(300)
 print("wifi: connected:", w.isconnected(), w.ifconfig()[0] if w.isconnected() else "")
 
 # ---- 1. chat completions (cheapest check of key + TLS + JSON) --------------

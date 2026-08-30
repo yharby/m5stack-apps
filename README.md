@@ -46,8 +46,9 @@ Requires an M5Stack CoreS3 running UIFlow2 `2.5.1`, Python 3.11+, and
 ```bash
 make setup
 cp device/config.example.json device/config.json
-# Add Wi-Fi and OpenAI credentials to device/config.json, then place the
-# private config at /flash/res/config.json on the device.
+# Add the OpenAI credential to device/config.json, then place the private
+# config at /flash/res/config.json on the device. Wi-Fi fields are optional
+# fallbacks; the translator normally follows UIFlow2's current network.
 make push
 make run
 ```
@@ -59,6 +60,12 @@ Wi-Fi QR code (`WIFI:T:WPA;S:network;P:password;;`) and connect to it. Successfu
 credentials are saved only in UIFlow2's own NVS settings, so its launcher uses
 the new network after the app exits or the device reboots. The QR password is
 never displayed or written to an extra plaintext file.
+
+The translator reads those UIFlow2 settings every time it needs to reconnect.
+It lets UIFlow2 finish any connection already started during boot, prefers the
+current UIFlow2 network, and only tries `config.json` Wi-Fi credentials as a
+fallback. This means switching networks with the QR app does not require
+editing or reinstalling the translator.
 
 ```bash
 make push APP=wifi_qr       # install it in APP.LIST

@@ -63,8 +63,12 @@ buffers, verified working at `bpp=16, psram=True`.
 **Plumbing.** The log file is held open instead of reopened per line, still
 flushed per line so it survives a wedge, and rotated at 64 KB. `ensure_wifi()`
 existed but was never called, so a dropped link surfaced as an opaque 45 s
-timeout; it now runs at boot and before each session. Wi-Fi modem power save
-is off, `pm` is the key this build accepts.
+timeout; it now runs at boot and before each session. It waits for UIFlow2's
+in-flight boot association, dynamically reads `ssid0`/`pswd0` from the
+`uiflow` NVS namespace, and uses JSON credentials only as a fallback. Wi-Fi
+modem power save is off, `pm` is the key this build accepts. The LCD now
+distinguishes Wi-Fi association from the API TLS warm-up, which can otherwise
+make a successful Wi-Fi connection look stuck for tens of seconds.
 
 ## Known remaining gaps
 
