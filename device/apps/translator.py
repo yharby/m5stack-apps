@@ -6,8 +6,8 @@ change the sensitivity gate and the maximum utterance length. Every stage is log
 /flash/translator.log and to the serial console.
 
 Device API facts, all verified by probing this board or by reading the
-uiflow-micropython 2.5.1 source. Do not "fix" these back to what the docs
-suggest, see the FACTS section of CLAUDE.md for the full list.
+uiflow-micropython 2.5.1 source. Do not "fix" these back to what generic docs
+suggest; see the verified I/O notes in CLAUDE.md.
 
   * audio.Recorder's second asynchronous capture wedges in its untimed ADF
     cleanup loop. This app does not construct one. M5.Mic owns one persistent
@@ -129,6 +129,13 @@ CFG = {
     # ES7210 PGA code. M5.Mic initializes code 11 and the maximum is 14.
     # Off by default until the I2C poke is verified on this unit.
     "analog_gain_code": 0,
+    # Optional SD transcript archive. Markdown is easy to read directly from
+    # the card; JSONL is available for structured downstream processing.
+    "save_transcripts": False,
+    "transcript_format": "md",
+    "transcript_max_file_bytes": 1024 * 1024,
+    # The firmware clock is UTC. Japan Standard Time is UTC+09:00.
+    "transcript_timezone_offset_minutes": 9 * 60,
 }
 
 SAMPLE_RATE = 16000
@@ -143,6 +150,14 @@ WIFI_ATTEMPT_TIMEOUT_MS = 15000
 WIFI_CREDENTIAL_GRACE_MS = 750
 WIFI_TRANSIENT_GRACE_MS = 2000
 WIFI_ATTEMPTS_PER_NETWORK = 3
+SD_MOUNT = "/sd"
+SD_TRANSCRIPT_DIR = "/sd/m5stack-apps/translator"
+SD_SLOT = 3
+SD_SCK = 36
+SD_MISO = 35
+SD_MOSI = 37
+SD_CS = 4
+SD_FREQ = 20_000_000
 # Measured on this unit with tools/device_scripts/thread_probe.py: a 32 KB
 # task stack CANNOT be created here and raises OSError("can't create
 # thread") every time, which silently sent every POST down do_post's
@@ -205,6 +220,16 @@ font_source_en = None
 font_trans_en = None
 capture_buffers = None
 settings_requested = False
+sd_ready = False
+sd_warning = ""
+transcript_session_base = None
+transcript_session_path = None
+transcript_session_epoch = None
+transcript_session_ticks = 0
+transcript_capture_epoch = None
+transcript_capture_ticks = 0
+transcript_part = 0
+transcript_sequence = 0
 
 # requests2 is synchronous. Run it on a Python worker so the main thread can
 # keep M5.update() moving and latch touch presses during TLS/network waits.
@@ -322,8 +347,29 @@ def load_config():
         break
     else:
         log("config: NONE of %s found" % (CONFIG_PATHS,))
+    CFG["save_transcripts"] = CFG["save_transcripts"] is True
+    if CFG["transcript_format"] not in ("md", "jsonl"):
+        CFG["transcript_format"] = "md"
+    try:
+        transcript_limit = int(CFG["transcript_max_file_bytes"])
+    except Exception:
+        transcript_limit = 1024 * 1024
+    if transcript_limit < 64 * 1024:
+        transcript_limit = 64 * 1024
+    elif transcript_limit > 8 * 1024 * 1024:
+        transcript_limit = 8 * 1024 * 1024
+    CFG["transcript_max_file_bytes"] = transcript_limit
+    try:
+        timezone_offset = int(CFG["transcript_timezone_offset_minutes"])
+    except Exception:
+        timezone_offset = 9 * 60
+    if timezone_offset < -12 * 60:
+        timezone_offset = -12 * 60
+    elif timezone_offset > 14 * 60:
+        timezone_offset = 14 * 60
+    CFG["transcript_timezone_offset_minutes"] = timezone_offset
     log(
-        "config: api_key=%s stt=%s chat=%s gate=%s chunk=%ss gain=%sx"
+        "config: api_key=%s stt=%s chat=%s gate=%s chunk=%ss gain=%sx transcripts=%s/%s"
         % (
             "yes" if CFG["openai_api_key"] else "NO",
             CFG["transcribe_model"],
@@ -331,6 +377,8 @@ def load_config():
             CFG["gate_dbfs"],
             CFG["chunk_seconds"],
             CFG["mic_gain"],
+            "on" if CFG["save_transcripts"] else "off",
+            CFG["transcript_format"],
         )
     )
 
@@ -338,6 +386,7 @@ def load_config():
 def save_config():
     """Persist only the tunables the settings page can change."""
     path = CONFIG_PATHS[0]
+    temp_path = path + ".tmp"
     try:
         try:
             with open(path) as f:
@@ -347,11 +396,27 @@ def save_config():
         data["gate_dbfs"] = CFG["gate_dbfs"]
         data["chunk_seconds"] = CFG["chunk_seconds"]
         data["mic_gain"] = CFG["mic_gain"]
-        with open(path, "w") as f:
+        data["save_transcripts"] = CFG["save_transcripts"]
+        data["transcript_format"] = CFG["transcript_format"]
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        with open(temp_path, "w") as f:
             f.write(json.dumps(data))
+            f.flush()
+        os.sync()
+        os.rename(temp_path, path)
+        os.sync()
         log(
-            "config: saved gate=%s chunk=%s gain=%s"
-            % (CFG["gate_dbfs"], CFG["chunk_seconds"], CFG["mic_gain"])
+            "config: saved gate=%s chunk=%s gain=%s transcripts=%s/%s"
+            % (
+                CFG["gate_dbfs"],
+                CFG["chunk_seconds"],
+                CFG["mic_gain"],
+                "on" if CFG["save_transcripts"] else "off",
+                CFG["transcript_format"],
+            )
         )
     except Exception as e:
         log("config: save failed %r" % e)
@@ -594,6 +659,361 @@ def ensure_wifi():
             return True
     log("wifi: all configured networks failed")
     return False
+
+
+# ------------------------------------------------------------------ SD transcripts
+
+
+def ensure_sd():
+    """Mount and verify the optional CoreS3 SD card without formatting it."""
+    global sd_ready
+
+    try:
+        stats = os.statvfs(SD_MOUNT)
+    except Exception:
+        try:
+            from hardware import sdcard
+
+            sdcard.SDCard(
+                slot=SD_SLOT,
+                width=1,
+                sck=SD_SCK,
+                miso=SD_MISO,
+                mosi=SD_MOSI,
+                cs=SD_CS,
+                freq=SD_FREQ,
+            )
+            stats = os.statvfs(SD_MOUNT)
+        except Exception as e:
+            sd_ready = False
+            log("sd: mount failed %r" % e)
+            return False
+
+    unit = stats[1] or stats[0]
+    total = unit * stats[2]
+    free = unit * stats[3]
+    if not sd_ready:
+        log("sd: ready total=%d MiB free=%d MiB" % (total // 1048576, free // 1048576))
+    sd_ready = True
+    return True
+
+
+def ensure_directory(path):
+    """Create each component of an absolute directory if it is missing."""
+    current = ""
+    for part in path.split("/"):
+        if not part:
+            continue
+        current += "/" + part
+        try:
+            os.mkdir(current)
+        except OSError:
+            try:
+                os.listdir(current)
+            except Exception:
+                raise
+
+
+def valid_clock(epoch=None):
+    """The firmware clock is useful only after UIFlow2 has synchronized it."""
+    try:
+        parts = time.localtime(time.time() if epoch is None else epoch)
+        return 2024 <= parts[0] <= 2100
+    except Exception:
+        return False
+
+
+def iso_timestamp(epoch, offset_minutes=0):
+    """Format an epoch using an explicit offset; the device clock itself is UTC."""
+    if epoch is None or not valid_clock(epoch):
+        return None
+    parts = time.localtime(epoch + offset_minutes * 60)
+    if offset_minutes == 0:
+        zone = "Z"
+    else:
+        sign = "+" if offset_minutes >= 0 else "-"
+        minutes = abs(offset_minutes)
+        zone = "%s%02d:%02d" % (sign, minutes // 60, minutes % 60)
+    return "%04d-%02d-%02dT%02d:%02d:%02d%s" % (
+        parts[0],
+        parts[1],
+        parts[2],
+        parts[3],
+        parts[4],
+        parts[5],
+        zone,
+    )
+
+
+def elapsed_timestamp(milliseconds):
+    milliseconds = max(0, int(milliseconds))
+    hours = milliseconds // 3600000
+    milliseconds %= 3600000
+    minutes = milliseconds // 60000
+    milliseconds %= 60000
+    seconds = milliseconds // 1000
+    return "%02d:%02d:%02d.%03d" % (hours, minutes, seconds, milliseconds % 1000)
+
+
+def transcript_extension():
+    return ".jsonl" if CFG["transcript_format"] == "jsonl" else ".md"
+
+
+def transcript_path_for_part(part):
+    suffix = "" if part == 1 else "-part%02d" % part
+    return transcript_session_base + suffix + transcript_extension()
+
+
+def unique_transcript_base(stem):
+    entries = os.listdir(SD_TRANSCRIPT_DIR)
+    for number in range(1, 1000):
+        suffix = "" if number == 1 else "-%03d" % number
+        name = stem + suffix
+        occupied = False
+        for entry in entries:
+            if entry in (name + ".md", name + ".jsonl") or (
+                entry.startswith(name + "-part")
+                and (entry.endswith(".md") or entry.endswith(".jsonl"))
+            ):
+                occupied = True
+                break
+        if not occupied:
+            return SD_TRANSCRIPT_DIR + "/" + name
+    raise OSError("too many transcript files with the same session name")
+
+
+def write_transcript_bytes(payload):
+    """Append one complete UTF-8 record, close it, and sync FAT immediately."""
+    global transcript_session_path, transcript_part, sd_ready
+
+    global sd_warning
+
+    if transcript_session_path is None:
+        return False
+    started = time.ticks_ms()
+    try:
+        try:
+            current_size = os.stat(transcript_session_path)[6]
+        except OSError:
+            current_size = 0
+        if current_size and current_size + len(payload) > CFG["transcript_max_file_bytes"]:
+            transcript_part += 1
+            transcript_session_path = transcript_path_for_part(transcript_part)
+            write_transcript_header()
+        with open(transcript_session_path, "ab") as target:
+            written = target.write(payload)
+            target.flush()
+        os.sync()
+        if written != len(payload):
+            raise OSError("short SD write")
+        return True
+    except Exception as e:
+        elapsed = time.ticks_diff(time.ticks_ms(), started)
+        log("sd: transcript write failed after %d ms: %r" % (elapsed, e))
+        transcript_session_path = None
+        sd_ready = False
+        sd_warning = "SD ERR"
+        set_status("SD save failed; listening", FG_ALERT)
+        return False
+
+
+def write_transcript_header():
+    """Create a new session/rotation file without ever overwriting a prior one."""
+    if CFG["transcript_format"] == "jsonl":
+        metadata = {
+            "type": "session",
+            "v": 1,
+            "session_id": transcript_session_base.rsplit("/", 1)[-1],
+            "started_at_utc": iso_timestamp(transcript_session_epoch),
+            "started_at_local": iso_timestamp(
+                transcript_session_epoch, CFG["transcript_timezone_offset_minutes"]
+            ),
+            "timezone_offset_minutes": CFG["transcript_timezone_offset_minutes"],
+            "part": transcript_part,
+            "transcribe_model": CFG["transcribe_model"],
+            "chat_model": CFG["chat_model"],
+        }
+        payload = (json.dumps(metadata) + "\n").encode()
+    else:
+        local = iso_timestamp(transcript_session_epoch, CFG["transcript_timezone_offset_minutes"])
+        utc = iso_timestamp(transcript_session_epoch)
+        payload = (
+            "# M5Stack Translator Session\n\n"
+            "- Session: `%s`\n"
+            "- Started locally: `%s`\n"
+            "- Started UTC: `%s`\n"
+            "- Models: `%s` / `%s`\n"
+            "- Part: %d\n\n"
+            % (
+                transcript_session_base.rsplit("/", 1)[-1],
+                local or "clock unavailable",
+                utc or "clock unavailable",
+                CFG["transcribe_model"],
+                CFG["chat_model"],
+                transcript_part,
+            )
+        ).encode()
+    last_error = None
+    for attempt in range(1, 3):
+        try:
+            with open(transcript_session_path, "wb") as target:
+                written = target.write(payload)
+                target.flush()
+            os.sync()
+            if written != len(payload):
+                raise OSError("short SD header write")
+            return
+        except OSError as e:
+            last_error = e
+            log("sd: header attempt %d/2 failed %r" % (attempt, e))
+            if attempt < 2:
+                time.sleep_ms(200)
+    raise last_error
+
+
+def start_transcript_session():
+    """Prepare one optional per-listening-session transcript file."""
+    global sd_ready, sd_warning
+    global transcript_session_base, transcript_session_path
+    global transcript_session_epoch, transcript_session_ticks
+    global transcript_capture_epoch, transcript_capture_ticks
+    global transcript_part, transcript_sequence
+
+    transcript_session_base = None
+    transcript_session_path = None
+    transcript_session_epoch = None
+    transcript_session_ticks = time.ticks_ms()
+    transcript_capture_epoch = None
+    transcript_capture_ticks = 0
+    transcript_part = 1
+    transcript_sequence = 0
+    sd_warning = ""
+    if not CFG["save_transcripts"]:
+        return False
+    if not ensure_sd():
+        sd_warning = "SD ERR"
+        set_status("SD unavailable; not saving", FG_ALERT)
+        return False
+    try:
+        ensure_directory(SD_TRANSCRIPT_DIR)
+        log("sd: transcript directory ready")
+        epoch = time.time()
+        if valid_clock(epoch):
+            transcript_session_epoch = epoch
+            local = time.localtime(epoch + CFG["transcript_timezone_offset_minutes"] * 60)
+            stem = "%04d%02d%02d-%02d%02d%02d" % local[:6]
+        else:
+            stem = "undated-%010d" % transcript_session_ticks
+        transcript_session_base = unique_transcript_base(stem)
+        transcript_session_path = transcript_path_for_part(transcript_part)
+        log("sd: creating transcript %s" % transcript_session_path)
+        write_transcript_header()
+        log("sd: transcript session %s" % transcript_session_path)
+        return True
+    except Exception as e:
+        log("sd: transcript session failed %r" % e)
+        sd_ready = False
+        transcript_session_base = None
+        transcript_session_path = None
+        sd_warning = "SD ERR"
+        set_status("SD unavailable; not saving", FG_ALERT)
+        return False
+
+
+def mark_transcript_capture_start():
+    """Anchor sequence timing immediately before the first mic buffer queues."""
+    global transcript_capture_epoch, transcript_capture_ticks
+
+    if transcript_session_path is None:
+        return
+    transcript_capture_ticks = time.ticks_ms()
+    epoch = time.time()
+    transcript_capture_epoch = epoch if valid_clock(epoch) else None
+
+
+def markdown_quote(text):
+    return "\n".join("> " + line if line else ">" for line in text.split("\n"))
+
+
+def save_transcript_chunk(recognized, start_seq, end_seq):
+    """Persist one successful bilingual turn; failures remain nonfatal."""
+    global transcript_sequence, transcript_session_path, sd_ready, sd_warning
+
+    if transcript_session_path is None:
+        return
+    started = time.ticks_ms()
+    try:
+        text, src = recognized
+        start_ms = start_seq * FRAME_MS
+        end_ms = end_seq * FRAME_MS
+        capture_epoch = transcript_capture_epoch
+        if capture_epoch is not None:
+            capture_epoch += start_ms // 1000
+        transcript_sequence += 1
+        record = {
+            "type": "turn",
+            "v": 1,
+            "seq": transcript_sequence,
+            "session_id": transcript_session_base.rsplit("/", 1)[-1],
+            "captured_at_utc": iso_timestamp(capture_epoch),
+            "captured_at_local": iso_timestamp(
+                capture_epoch, CFG["transcript_timezone_offset_minutes"]
+            ),
+            "audio_start_ms": start_ms,
+            "audio_end_ms": end_ms,
+            "saved_elapsed_ms": time.ticks_diff(time.ticks_ms(), transcript_capture_ticks),
+            "source_lang": src,
+            "target_lang": last_trans_lang,
+            "original": text,
+            "translation": last_trans,
+        }
+        if CFG["transcript_format"] == "jsonl":
+            payload = (json.dumps(record) + "\n").encode()
+        else:
+            stamp = record["captured_at_local"] or ("+" + elapsed_timestamp(start_ms))
+            utc = record["captured_at_utc"] or "clock unavailable"
+            payload = (
+                "## %s\n\n"
+                "- UTC: `%s`\n"
+                "- Audio: `+%s` to `+%s`\n\n"
+                "**Original (%s)**\n\n%s\n\n"
+                "**Translation (%s)**\n\n%s\n\n"
+                % (
+                    stamp,
+                    utc,
+                    elapsed_timestamp(start_ms),
+                    elapsed_timestamp(end_ms),
+                    src,
+                    markdown_quote(text),
+                    last_trans_lang,
+                    markdown_quote(last_trans),
+                )
+            ).encode()
+
+        service_capture()
+        if write_transcript_bytes(payload):
+            elapsed = time.ticks_diff(time.ticks_ms(), started)
+            log(
+                "sd: saved turn=%d bytes=%d in %d ms" % (transcript_sequence, len(payload), elapsed)
+            )
+    except Exception as e:
+        elapsed = time.ticks_diff(time.ticks_ms(), started)
+        log("sd: optional save failed after %d ms: %r" % (elapsed, e))
+        transcript_session_path = None
+        sd_ready = False
+        sd_warning = "SD ERR"
+        set_status("SD save failed; listening", FG_ALERT)
+    finally:
+        service_capture()
+
+
+def end_transcript_session():
+    global transcript_session_base, transcript_session_path
+
+    if transcript_session_path is not None:
+        log("sd: transcript closed %s" % transcript_session_path)
+    transcript_session_base = None
+    transcript_session_path = None
 
 
 # ------------------------------------------------------------------ levels
@@ -1048,10 +1468,20 @@ ROWS = (
     ("Gain", "mic_gain", "x", GAIN_MIN, GAIN_MAX),
 )
 BACK_BOX = (10, 194, 120, 34)
+SD_SAVE_BOX = (140, 194, 170, 34)
+
+
+def draw_sd_toggle():
+    enabled = CFG["save_transcripts"]
+    color = FG_TRANS if enabled else FG_PANEL
+    M5.Lcd.fillRoundRect(SD_SAVE_BOX[0], SD_SAVE_BOX[1], SD_SAVE_BOX[2], SD_SAVE_BOX[3], 8, color)
+    M5.Lcd.setTextColor(BG if enabled else FG_TEXT, color)
+    label = "SD Save %s" % ("ON" if enabled else "OFF")
+    M5.Lcd.drawString(label, SD_SAVE_BOX[0] + 24, SD_SAVE_BOX[1] + 7)
 
 
 def settings_page():
-    """Live meters for both ES7210 mics, plus the three tunables."""
+    """Live meters, audio tunables, and the optional SD transcript toggle."""
     global last_level
 
     if font_ui is not None:
@@ -1079,6 +1509,7 @@ def settings_page():
     M5.Lcd.fillRoundRect(BACK_BOX[0], BACK_BOX[1], BACK_BOX[2], BACK_BOX[3], 8, FG_PANEL)
     M5.Lcd.setTextColor(FG_TEXT, FG_PANEL)
     M5.Lcd.drawString("Back", BACK_BOX[0] + 34, BACK_BOX[1] + 7)
+    draw_sd_toggle()
 
     # M5.Mic's persistent task accepts arbitrary buffer lengths. A 150 ms
     # stereo frame gives responsive independent meters for the two real mics.
@@ -1089,7 +1520,8 @@ def settings_page():
 
     while True:
         M5.update()
-        pos = tap()
+        tap_pos = tap()
+        pos = tap_pos
         if pos is None:
             held = holding()
             now = time.ticks_ms()
@@ -1103,6 +1535,11 @@ def settings_page():
             x, y = pos
             if hit(x, y, BACK_BOX):
                 break
+            if tap_pos is not None and hit(x, y, SD_SAVE_BOX):
+                CFG["save_transcripts"] = not CFG["save_transcripts"]
+                dirty = True
+                draw_sd_toggle()
+                continue
             for ry, row in zip(ROW_Y, ROWS):
                 label, key, unit, lo, hi = row
                 down = (214, ry, 44, 30)
@@ -1441,6 +1878,7 @@ def begin_capture():
             max_frames * FRAME_MS // 1000,
         )
     )
+    mark_transcript_capture_start()
     queue_capture(capture_buffers[0])
     queue_capture(capture_buffers[1])
     pump_armed = True
@@ -2521,6 +2959,17 @@ def translate(text, src):
 # ------------------------------------------------------------------ pipeline
 
 
+def listening_status(held=0):
+    text = "Listening"
+    if held:
+        text += "  %d s" % held
+    if transcript_session_path is not None:
+        text += " + SD"
+    elif sd_warning:
+        text += " / " + sd_warning
+    return text
+
+
 def wait_for_utterance():
     """Poll input and the mic pump until the endpointer closes an utterance.
 
@@ -2535,10 +2984,7 @@ def wait_for_utterance():
         held = tail_seq - open_seq if speech_windows else 0
         if held != shown:
             shown = held
-            if held:
-                set_status("Listening  %d s" % held)
-            else:
-                set_status("Listening")
+            set_status(listening_status(held))
         time.sleep_ms(20)
 
 
@@ -2681,10 +3127,11 @@ def run_session():
         drain_captures()
 
     try:
+        start_transcript_session()
         # Inside the try so a rejected first queue still reaches end_capture,
         # which is the only thing that drains M5.Mic's raw pointers.
         begin_capture()
-        set_status("Listening")
+        set_status(listening_status())
         while running:
             wait_for_utterance()
             if not running:
@@ -2708,9 +3155,13 @@ def run_session():
             if recognized is not None:
                 set_status("Listening and translating...")
                 finish_translation(recognized)
+                save_transcript_chunk(recognized, start_seq, end_seq)
             gc.collect()
     finally:
-        end_capture()
+        try:
+            end_capture()
+        finally:
+            end_transcript_session()
 
 
 # ------------------------------------------------------------------ lifecycle

@@ -26,6 +26,7 @@ REMOTE_AUTORUN = "/flash/main.py"  # what the device runs on boot / APP.RUN
 DEFAULT_APP = "translator"
 REMOTE_LOG = "/flash/translator.log"
 SELFTEST = "tools/device_scripts/selftest.py"
+SD_PROBE = "tools/device_scripts/sd_probe.py"
 
 
 def app_paths(name: str) -> tuple[str, str]:
@@ -194,6 +195,13 @@ def cmd_selftest(port: str, _args) -> int:
     return mp(port, "run", SELFTEST).returncode
 
 
+def cmd_sd_probe(port: str, _args) -> int:
+    """Mount the CoreS3 SD card and verify temporary read/write/sync."""
+    breakin(port)
+    print(f"[m5] running {SD_PROBE} on device\n")
+    return mp(port, "run", SD_PROBE).returncode
+
+
 def cmd_repl(port: str, _args) -> int:
     breakin(port)
     return mp(port, "repl").returncode
@@ -277,6 +285,7 @@ COMMANDS = {
     "run": cmd_run,
     "run-file": cmd_run_file,
     "selftest": cmd_selftest,
+    "sd-probe": cmd_sd_probe,
     "repl": cmd_repl,
     "reset": cmd_reset,
     "logs": cmd_logs,

@@ -10,7 +10,7 @@
 M5  := uv run python tools/m5.py
 APP ?= translator
 
-.PHONY: help setup catalog info ls apps push autorun rm-app run selftest probe \
+.PHONY: help setup catalog info ls apps push autorun rm-app run selftest sd-probe probe \
         repl reset logs clear-logs lint format check
 
 help:
@@ -45,6 +45,9 @@ run:        ## run app live, streaming its output here     (APP=name)
 
 selftest:   ## translator end-to-end check: config, wifi, mic, OpenAI
 	@$(M5) selftest
+
+sd-probe:   ## mount and verify a CoreS3 SD card safely
+	@$(M5) sd-probe
 
 probe:      ## hardware smoke test (config, wifi, display, mic)
 	@$(M5) probe

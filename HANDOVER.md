@@ -4,9 +4,9 @@ This document is specific to `device/apps/translator.py` in the broader
 M5Stack Apps registry. Repository-wide workflow and platform facts live in
 `README.md` and `CLAUDE.md`.
 
-Updated 2026-08-28 after a latency and smoothness pass. Read `CLAUDE.md`
-first; its verified platform facts are the durable reference and include
-corrected entries that contradict earlier notes.
+Updated 2026-08-30 after latency, Wi-Fi, and optional SD transcript passes.
+Read `CLAUDE.md` first; its verified platform facts are the durable reference
+and include corrected entries that contradict earlier notes.
 
 ## Current status: working, measurably faster
 
@@ -73,6 +73,14 @@ in-flight boot association, dynamically reads `ssid0`/`pswd0` from the
 modem power save is off, `pm` is the key this build accepts. The LCD now
 distinguishes Wi-Fi association from the API TLS warm-up, which can otherwise
 make a successful Wi-Fi connection look stuck for tens of seconds.
+
+**Storage.** SD transcript saving is opt-in from Settings. It creates one
+bounded Markdown (default) or JSONL file set per listening session under
+`/sd/m5stack-apps/translator/`, recording both languages, relative audio time,
+UTC, and a fixed configured local offset. Every completed turn is appended,
+closed, and synced; ordinary SD errors disable saving for that session without
+stopping translation. The real 32 GB card passed mount/read/write/UTF-8 tests,
+and live turn writes measured 19-108 ms.
 
 ## Known remaining gaps
 

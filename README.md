@@ -9,7 +9,7 @@ be installed directly into its `APP.LIST` menu.
 | App | What it does | Hardware | Configuration |
 |---|---|---|---|
 | [`wifi_qr`](device/apps/wifi_qr.py) | Scans a standard Wi-Fi QR code and safely switches UIFlow2's saved network | Camera, touch | None |
-| [`translator`](device/apps/translator.py) | Realtime English ↔ Japanese speech translation for FOSS4G and geospatial conversations | Microphones, display, touch, Wi-Fi | OpenAI API key |
+| [`translator`](device/apps/translator.py) | Realtime English ↔ Japanese speech translation for FOSS4G and geospatial conversations | Microphones, display, touch, Wi-Fi; optional SD | OpenAI API key |
 
 Both apps are production-tested on an M5Stack CoreS3 with UIFlow2 `2.5.1` and
 MicroPython `1.27.0`. Compatibility with other M5Stack models is not assumed;
@@ -88,6 +88,41 @@ Tap the screen to start or pause. Tap the gear for microphone meters and
 sensitivity controls. `Chunk` is the maximum utterance length when no natural
 pause occurs.
 
+### Optional SD transcripts
+
+Insert a FAT32-formatted SDHC card up to 32 GB; a genuine 16 or 32 GB card is
+the safest choice. On CoreS3, insert it with the contacts facing the same
+direction as the screen. Stop Translator and any other SD user before running:
+
+```bash
+make sd-probe
+```
+
+In Translator settings, toggle **SD Save ON**. Saving is off by default, and
+ordinary missing/full/write errors are handled as nonfatal so translation can
+continue. Hot removal is unsupported: stop listening and exit/reset the app
+before removing the card. Each listening session gets one file set under
+`/sd/m5stack-apps/translator/`; completed turns are appended, flushed, closed,
+and synced individually. Files rotate into bounded parts at 1 MiB by default.
+
+Markdown is the default because it opens cleanly on any computer. Set
+`"transcript_format": "jsonl"` in the device config for one structured record
+per line. Both contain original text, translation, language direction,
+capture-relative timing, UTC, and Japan local time when UIFlow2 has synchronized
+the clock. Otherwise filenames are `undated-*`, JSON timestamps are null, and
+Markdown uses relative time. The firmware clock is UTC, so the example config
+uses a fixed Japan offset of `540` minutes; this is an offset, not a timezone
+database or daylight-saving calculation:
+
+```json
+{
+  "save_transcripts": false,
+  "transcript_format": "md",
+  "transcript_max_file_bytes": 1048576,
+  "transcript_timezone_offset_minutes": 540
+}
+```
+
 ## Development workflow
 
 ```bash
@@ -99,6 +134,7 @@ make run APP=<name>          # run source live over USB
 make autorun APP=<name>      # install the selected app as /flash/main.py
 make rm-app APP=<name>       # remove one installed app
 make probe                   # display, microphone, config, and Wi-Fi smoke test
+make sd-probe                # SD mount, capacity, write/read/sync test
 make selftest                # translator network/mic/OpenAI end-to-end test
 make logs                    # read /flash/translator.log
 make reset                   # reboot into UIFlow2

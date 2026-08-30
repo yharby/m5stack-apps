@@ -31,5 +31,9 @@
   ],
   "gate_dbfs": -52,
   "chunk_seconds": 6,
-  "mic_gain": 4
+  "mic_gain": 4,
+  "save_transcripts": false,
+  "transcript_format": "md",
+  "transcript_max_file_bytes": 1048576,
+  "transcript_timezone_offset_minutes": 540
 }
