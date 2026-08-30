@@ -52,6 +52,25 @@ make push
 make run
 ```
 
+## Wi-Fi QR setup app
+
+`device/apps/wifi_qr.py` uses the CoreS3's built-in camera to scan a standard
+Wi-Fi QR code (`WIFI:T:WPA;S:network;P:password;;`) and connect to it. Successful
+credentials are saved only in UIFlow2's own NVS settings, so its launcher uses
+the new network after the app exits or the device reboots. The QR password is
+never displayed or written to an extra plaintext file.
+
+```bash
+make push APP=wifi_qr       # install it in APP.LIST
+make run APP=wifi_qr        # run it over USB for development
+```
+
+The camera starts immediately. Confirm the detected SSID with **CONNECT** or
+cancel without changing networks. After connecting, use **SCAN AGAIN** for a
+different network or **EXIT** to reboot into the UIFlow2 launcher. The power
+button exits from any screen. CoreS3 supports 2.4 GHz Wi-Fi, not 5 GHz-only
+networks.
+
 Tap the screen to start or pause. Tap the gear for microphone meters and
 sensitivity controls, where `Chunk` sets the longest an utterance can run
 before it is sent regardless of pauses.
