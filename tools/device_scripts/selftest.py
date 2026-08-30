@@ -166,18 +166,23 @@ header = struct.pack(
 wav = bytearray(header)
 wav += pcm
 
+model = CFG.get("transcribe_model", "gpt-transcribe")
+fields = [("model", model), ("response_format", "json")]
+if model == "gpt-transcribe":
+    # Mirror translator.py. Only gpt-transcribe accepts these; every other
+    # model rejects the whole request with HTTP 400 invalid_parameter.
+    fields += [
+        ("languages[]", "en"),
+        ("languages[]", "ja"),
+        ("keywords[]", "FOSS4G"),
+        ("keywords[]", "OSGeo"),
+        ("keywords[]", "STAC"),
+        ("keywords[]", "GeoParquet"),
+        ("keywords[]", "MapLibre"),
+    ]
+
 body = bytearray()
-for name, value in (
-    ("model", CFG.get("transcribe_model", "gpt-transcribe")),
-    ("response_format", "json"),
-    ("languages[]", "en"),
-    ("languages[]", "ja"),
-    ("keywords[]", "FOSS4G"),
-    ("keywords[]", "OSGeo"),
-    ("keywords[]", "STAC"),
-    ("keywords[]", "GeoParquet"),
-    ("keywords[]", "MapLibre"),
-):
+for name, value in fields:
     body += (
         "--" + BOUNDARY + "\r\n"
         'Content-Disposition: form-data; name="' + name + '"\r\n\r\n' + value + "\r\n"

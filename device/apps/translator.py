@@ -1,9 +1,10 @@
-"""Realtime EN <-> JA speech translator for M5Stack CoreS3 (UIFlow2 MicroPython).
+"""Realtime multilingual speech translator for M5Stack CoreS3.
 
-Tap the screen or press the power button to start and stop. Tap the gear in
-the top right for the settings page, which shows live mic meters and lets you
-change the sensitivity gate and the maximum utterance length. Every stage is logged to
-/flash/translator.log and to the serial console.
+Use the dedicated bottom controls to choose a language pair and start or stop
+listening. The transcript is a bounded conversation feed: it follows the newest
+turn until the user swipes upward, then exposes a Live button to resume. Tap the
+gear for microphone and storage settings, or EXIT to return to UIFlow. Every stage is logged to
+/flash/translator.log and the serial console.
 
 Device API facts, all verified by probing this board or by reading the
 uiflow-micropython 2.5.1 source. Do not "fix" these back to what generic docs
@@ -21,7 +22,9 @@ suggest; see the verified I/O notes in CLAUDE.md.
     There is no wasClicked() method, it is getDetail(0)[6].
   * M5.update() must run every loop or touch state never changes.
   * Colours are 24 bit 0xRRGGBB ints. There is no color565().
-  * Japanese needs M5.Lcd.FONTS.AlibabaSansJA24 or glyphs do not render.
+  * Japanese, Korean and Chinese need their matching UIFlow2 font objects.
+  * Arabic/Hebrew require the repository's RTL UIFlow2 firmware profile;
+    stock UIFlow2 disables bidi ordering and Arabic contextual shaping.
   * CoreS3 has no BtnA/B/C, only BtnPWR.
   * requests2 has no files= parameter, so the multipart body is hand built
     and passed as data=<bytearray>.
@@ -46,8 +49,9 @@ import struct
 import sys
 import time
 
+import lvgl as lv
 import M5
-import micropython
+import m5ui
 import network
 import requests2
 from M5 import BtnPWR
@@ -100,14 +104,82 @@ DEFAULT_DOMAIN_KEYWORDS = (
     "WMTS",
 )
 
+# Direction and renderer are explicit so text never silently falls through to
+# a Latin font. The rtl renderer is supplied by this repository's UIFlow2
+# firmware patch; logical Unicode order is retained everywhere outside LVGL.
+LANGUAGE_PROFILES = {
+    "en": {
+        "name": "English",
+        "native": "English",
+        "short": "EN",
+        "script": "latin",
+        "direction": "ltr",
+        "font": "latin",
+    },
+    "ja": {
+        "name": "Japanese",
+        "native": "日本語",
+        "short": "JA",
+        "script": "japanese",
+        "direction": "ltr",
+        "font": "ja",
+    },
+    "ko": {
+        "name": "Korean",
+        "native": "한국어",
+        "short": "KO",
+        "script": "hangul",
+        "direction": "ltr",
+        "font": "ko",
+    },
+    "zh": {
+        "name": "Simplified Chinese",
+        "native": "中文",
+        "short": "ZH",
+        "script": "han",
+        "direction": "ltr",
+        "font": "zh",
+    },
+    "ar": {
+        "name": "Arabic",
+        "native": "العربية",
+        "short": "AR",
+        "script": "arabic",
+        "direction": "rtl",
+        "font": "rtl",
+    },
+    "he": {
+        "name": "Hebrew",
+        "native": "עברית",
+        "short": "HE",
+        "script": "hebrew",
+        "direction": "rtl",
+        "font": "rtl",
+    },
+    # Modern Mongolian is normally written in Cyrillic and is horizontal LTR.
+    # Traditional vertical Mongolian is a separate renderer capability and is
+    # intentionally rejected until the device has a vertical-layout font/UI.
+    "mn": {
+        "name": "Mongolian",
+        "native": "Монгол",
+        "short": "MN",
+        "script": "cyrillic",
+        "direction": "ltr",
+        "font": "mn",
+    },
+}
+LANGUAGE_CODES = ("en", "ja", "ko", "zh", "ar", "he", "mn")
+
 CFG = {
     "wifi_ssid": "",
     "wifi_pass": "",
     "openai_api_key": "",
     "transcribe_url": "https://api.openai.com/v1/audio/transcriptions",
     "chat_url": "https://api.openai.com/v1/chat/completions",
-    "transcribe_model": "gpt-transcribe",
-    "chat_model": "gpt-5.6-luna",
+    # Speed-first defaults. The mini models trade a little accuracy for much
+    # lower latency; both were verified with this device/account.
+    "transcribe_model": "gpt-4o-mini-transcribe",
+    "chat_model": "gpt-4o-mini",
     # gpt-transcribe supports a keywords array specifically for domain terms.
     # This can be replaced by a JSON array in the device config.
     "domain_keywords": DEFAULT_DOMAIN_KEYWORDS,
@@ -115,6 +187,13 @@ CFG = {
         "a live FOSS4G/OSGeo conversation about open geospatial standards, "
         "software, data formats, and cloud-native geospatial architecture"
     ),
+    # A session is bidirectional between exactly two capability-checked
+    # languages. Auto chooses the speaker side from API metadata and script;
+    # fixed_a/fixed_b can be used where automatic detection is undesirable.
+    "language_pair": ["en", "ja"],
+    "source_mode": "auto",
+    # History is bounded independently of the optional full SD transcript.
+    "history_turns": 8,
     # Sensitivity. Measured from the PCM buffer, which reads about 13 dB
     # higher than the broken recorder.rms(). Quiet room is about -55 dBFS on
     # this unit and speech peaks about -32 dBFS, so -52 is deliberately hot.
@@ -129,6 +208,8 @@ CFG = {
     # ES7210 PGA code. M5.Mic initializes code 11 and the maximum is 14.
     # Off by default until the I2C poke is verified on this unit.
     "analog_gain_code": 0,
+    # Production logs contain timings and lengths, not conversation content.
+    "debug_content_logs": False,
     # Optional SD transcript archive. Markdown is easy to read directly from
     # the card; JSONL is available for structured downstream processing.
     "save_transcripts": False,
@@ -167,7 +248,7 @@ SD_FREQ = 20_000_000
 HTTP_THREAD_STACK = 16384
 
 GATE_MIN, GATE_MAX = -70, -25
-CHUNK_MIN, CHUNK_MAX = 3, 15
+CHUNK_MIN, CHUNK_MAX = 4, 12
 GAIN_MIN, GAIN_MAX = 1, 16
 
 # ES7210 is at 7 bit address 0x40 on internal I2C port 1, SCL 11, SDA 12.
@@ -194,30 +275,76 @@ BG = 0x000000
 FG_STATUS = 0x00CFFF
 FG_ORIG = 0xE0E0E0
 FG_TRANS = 0x40FF70
-FG_DIM = 0x707070
+FG_DIM = 0x808080
 FG_LINE = 0x404040
 FG_ALERT = 0xFF5050
 FG_TEXT = 0xFFFFFF
 FG_PANEL = 0x303030
+FG_ACTIVE = 0x184A55
 
-GEAR_BOX = (288, 1, 32, 30)
-# Keep the icon compact, but give a fingertip a full 44 x 44 px target.
-GEAR_HIT_BOX = (276, 0, 44, 44)
+HEADER_H = 44
+ACTION_Y = 196
+ACTION_H = H - ACTION_Y
+VIEW_Y = HEADER_H
+VIEW_H = ACTION_Y - VIEW_Y
+EXIT_BOX = (260, 0, 60, HEADER_H)
+LANGUAGE_BOX = (0, ACTION_Y, 112, ACTION_H)
+RUN_BOX = (112, ACTION_Y, 120, ACTION_H)
+LIVE_BOX = (232, ACTION_Y, 44, ACTION_H)
+GEAR_HIT_BOX = (276, ACTION_Y, 44, ACTION_H)
 
 BOUNDARY = "----M5CoreS3TranslatorBoundary"
 
 running = False
 fatal = ""
+config_error = ""
 last_orig = ""
 last_trans = ""
 last_src = "en"
 last_trans_lang = "ja"
 last_level = -99.0
 font_ja = None
+font_ko = None
+font_zh = None
+font_ar_source = None
+font_ar_translation = None
+font_he_source = None
+font_he_translation = None
+rtl_firmware_abi = 0
 font_ui = None
 font_label = None
 font_source_en = None
 font_trans_en = None
+ui_screen = None
+ui_feed = None
+ui_status = None
+ui_pair_label = None
+ui_run_label = None
+ui_live_button = None
+ui_live_label = None
+ui_callbacks = []
+ui_cards = []
+ui_turn_views = []
+ui_programmatic_scroll = False
+language_requested = False
+stop_requested = False
+exit_requested = False
+ui_action = None
+ui_port_loop = None
+ui_last_tick = 0
+# Each turn is a small dict so it remains cheap on MicroPython and serializes
+# cleanly when needed. The active recognized turn lives in the same ring and
+# changes state in place from translating to complete/error.
+turns = []
+active_turn = None
+follow_latest = True
+scroll_lines = 0
+new_turns_while_scrolled = 0
+feed_revision = 0
+feed_painted_revision = -1
+touch_origin = None
+touch_last = None
+touch_dragged = False
 capture_buffers = None
 settings_requested = False
 sd_ready = False
@@ -245,6 +372,7 @@ except Exception:
 
 _log_file = None
 _log_writes = 0
+_log_rotation_deferred = False
 
 
 def _open_log():
@@ -276,9 +404,10 @@ def _close_log():
 
 def _rotate_log():
     """Keep one previous log so /flash cannot fill up during a long session."""
-    global _log_writes
+    global _log_writes, _log_rotation_deferred
 
     _log_writes = 0
+    _log_rotation_deferred = False
     try:
         size = os.stat(LOG_PATH)[6]
     except Exception:
@@ -298,10 +427,15 @@ def _rotate_log():
 
 
 def log(msg):
-    global _log_writes
+    global _log_writes, _log_rotation_deferred
 
     line = "[t=%d] %s" % (time.ticks_ms(), msg)
     print(line)
+    # Flash stat/rename can block for over a second on this firmware. Once a
+    # capture session reaches the rotation checkpoint, keep serial logging but
+    # defer further flash writes and the rotation itself until capture stops.
+    if _log_rotation_deferred and pump_armed:
+        return
     f = _log_file
     if f is None:
         f = _open_log()
@@ -318,7 +452,10 @@ def log(msg):
         return
     _log_writes += 1
     if _log_writes >= LOG_ROTATE_EVERY:
-        _rotate_log()
+        if pump_armed:
+            _log_rotation_deferred = True
+        else:
+            _rotate_log()
 
 
 def log_exc(e):
@@ -333,7 +470,167 @@ def log_exc(e):
 # ------------------------------------------------------------------ config
 
 
+def configured_pair():
+    pair = CFG.get("language_pair")
+    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+        return ("en", "ja")
+    a, b = str(pair[0]), str(pair[1])
+    if a not in LANGUAGE_PROFILES or b not in LANGUAGE_PROFILES or a == b:
+        return ("en", "ja")
+    return (a, b)
+
+
+def normalize_language_code(value):
+    text = str(value or "").strip().replace("_", "-")
+    folded = "".join(chr(ord(ch) + 32) if "A" <= ch <= "Z" else ch for ch in text)
+    base = folded.split("-", 1)[0]
+    aliases = {
+        "en": "en",
+        "eng": "en",
+        "english": "en",
+        "ja": "ja",
+        "jpn": "ja",
+        "japanese": "ja",
+        "ko": "ko",
+        "kor": "ko",
+        "korean": "ko",
+        "zh": "zh",
+        "zho": "zh",
+        "chi": "zh",
+        "cmn": "zh",
+        "chinese": "zh",
+        "mandarin": "zh",
+        "ar": "ar",
+        "ara": "ar",
+        "arabic": "ar",
+        "he": "he",
+        "heb": "he",
+        "hebrew": "he",
+        "mn": "mn",
+        "mon": "mn",
+        "mongolian": "mn",
+    }
+    return aliases.get(folded, aliases.get(base, ""))
+
+
+def language_profile(code):
+    return LANGUAGE_PROFILES.get(code, LANGUAGE_PROFILES["en"])
+
+
+def language_short(code):
+    return language_profile(code)["short"]
+
+
+def other_language(code):
+    a, b = configured_pair()
+    return b if code == a else a
+
+
+def script_language(text):
+    """Return a decisive script language, or an empty string if ambiguous.
+
+    Text remains in logical Unicode order. This function only selects a route;
+    it never reverses or presentation-shapes text for display.
+    """
+    counts = {"en": 0, "ja": 0, "ko": 0, "zh": 0, "ar": 0, "he": 0, "mn": 0}
+    for ch in text:
+        code = ord(ch)
+        if 0x0590 <= code <= 0x05FF or 0xFB1D <= code <= 0xFB4F:
+            counts["he"] += 1
+        elif (
+            0x0600 <= code <= 0x06FF
+            or 0x0750 <= code <= 0x077F
+            or 0x08A0 <= code <= 0x08FF
+            or 0xFB50 <= code <= 0xFDFF
+            or 0xFE70 <= code <= 0xFEFF
+        ):
+            counts["ar"] += 1
+        elif 0x3040 <= code <= 0x30FF or 0x31F0 <= code <= 0x31FF:
+            counts["ja"] += 1
+        elif 0x1100 <= code <= 0x11FF or 0x3130 <= code <= 0x318F or 0xAC00 <= code <= 0xD7AF:
+            counts["ko"] += 1
+        elif 0x0400 <= code <= 0x052F:
+            counts["mn"] += 1
+        elif 0x3400 <= code <= 0x4DBF or 0x4E00 <= code <= 0x9FFF:
+            counts["zh"] += 1
+        elif 0x0041 <= code <= 0x005A or 0x0061 <= code <= 0x007A:
+            counts["en"] += 1
+    # Kana is decisive for Japanese even when the same sentence contains more
+    # Han characters. Han is considered only when no language-specific script
+    # is present.
+    best = ""
+    best_count = 0
+    tied = False
+    for code in ("ar", "he", "ko", "ja", "mn"):
+        count = counts[code]
+        if count > best_count:
+            best, best_count, tied = code, count, False
+        elif count and count == best_count:
+            tied = True
+    if best_count:
+        return "" if tied else best
+    if counts["zh"]:
+        return "zh"
+    return "en" if counts["en"] else ""
+
+
+def resolve_route(text, api_code=""):
+    """Resolve the source and target within the configured two-language pair."""
+    pair = configured_pair()
+    mode = CFG.get("source_mode", "auto")
+    if mode in pair:
+        return mode, other_language(mode)
+
+    scripted = script_language(text)
+    api_lang = normalize_language_code(api_code)
+
+    # Han alone cannot distinguish Japanese from Chinese. Kana is decisive
+    # for Japanese; otherwise prefer matching API metadata or the only Han
+    # language selected in the pair.
+    if scripted == "zh":
+        if api_lang in pair and api_lang in ("ja", "zh"):
+            scripted = api_lang
+        elif "zh" in pair and "ja" not in pair:
+            scripted = "zh"
+        elif "ja" in pair and "zh" not in pair:
+            scripted = "ja"
+
+    if scripted:
+        if scripted in pair:
+            return scripted, other_language(scripted)
+        return "", ""
+    if api_lang in pair:
+        return api_lang, other_language(api_lang)
+    return pair[0], pair[1]
+
+
+def pair_render_error(pair=None):
+    """Gate sessions whose selected scripts cannot be rendered faithfully."""
+    if pair is None:
+        pair = configured_pair()
+    rtl_fonts = {
+        "ar": (font_ar_source, font_ar_translation),
+        "he": (font_he_source, font_he_translation),
+    }
+    if rtl_firmware_abi != 2 and ("ar" in pair or "he" in pair):
+        return "RTL firmware required"
+    for code in ("ar", "he"):
+        if code in pair and any(font is None for font in rtl_fonts[code]):
+            return "%s font unavailable" % language_short(code)
+    missing = []
+    for code, font in (("ja", font_ja), ("ko", font_ko), ("zh", font_zh), ("mn", font_ja)):
+        if code in pair and font is None:
+            missing.append(language_short(code))
+    if missing:
+        return "%s font unavailable" % "/".join(missing)
+    return ""
+
+
 def load_config():
+    global config_error
+
+    config_error = ""
+
     for path in CONFIG_PATHS:
         try:
             with open(path) as f:
@@ -348,6 +645,33 @@ def load_config():
     else:
         log("config: NONE of %s found" % (CONFIG_PATHS,))
     CFG["save_transcripts"] = CFG["save_transcripts"] is True
+    CFG["debug_content_logs"] = CFG["debug_content_logs"] is True
+    pair = CFG.get("language_pair")
+    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+        config_error = "language_pair needs two codes"
+        pair = ("en", "ja")
+    else:
+        pair = (normalize_language_code(pair[0]), normalize_language_code(pair[1]))
+        if not pair[0] or not pair[1] or pair[0] == pair[1]:
+            config_error = "language_pair is invalid"
+            pair = ("en", "ja")
+    CFG["language_pair"] = list(pair)
+    source_mode = normalize_language_code(CFG["source_mode"])
+    if CFG["source_mode"] == "auto":
+        source_mode = "auto"
+    if source_mode != "auto" and source_mode not in pair:
+        config_error = "source_mode must be auto or in pair"
+        source_mode = "auto"
+    CFG["source_mode"] = source_mode
+    try:
+        history_turns = int(CFG["history_turns"])
+    except Exception:
+        history_turns = 8
+    if history_turns < 2:
+        history_turns = 2
+    elif history_turns > 12:
+        history_turns = 12
+    CFG["history_turns"] = history_turns
     if CFG["transcript_format"] not in ("md", "jsonl"):
         CFG["transcript_format"] = "md"
     try:
@@ -369,11 +693,16 @@ def load_config():
         timezone_offset = 14 * 60
     CFG["transcript_timezone_offset_minutes"] = timezone_offset
     log(
-        "config: api_key=%s stt=%s chat=%s gate=%s chunk=%ss gain=%sx transcripts=%s/%s"
+        "config: api_key=%s stt=%s chat=%s pair=%s/%s mode=%s history=%d "
+        "gate=%s chunk=%ss gain=%sx transcripts=%s/%s"
         % (
             "yes" if CFG["openai_api_key"] else "NO",
             CFG["transcribe_model"],
             CFG["chat_model"],
+            CFG["language_pair"][0],
+            CFG["language_pair"][1],
+            CFG["source_mode"],
+            CFG["history_turns"],
             CFG["gate_dbfs"],
             CFG["chunk_seconds"],
             CFG["mic_gain"],
@@ -398,6 +727,9 @@ def save_config():
         data["mic_gain"] = CFG["mic_gain"]
         data["save_transcripts"] = CFG["save_transcripts"]
         data["transcript_format"] = CFG["transcript_format"]
+        data["language_pair"] = list(configured_pair())
+        data["source_mode"] = CFG["source_mode"]
+        data["history_turns"] = CFG["history_turns"]
         try:
             os.remove(temp_path)
         except OSError:
@@ -409,8 +741,11 @@ def save_config():
         os.rename(temp_path, path)
         os.sync()
         log(
-            "config: saved gate=%s chunk=%s gain=%s transcripts=%s/%s"
+            "config: saved pair=%s/%s mode=%s gate=%s chunk=%s gain=%s transcripts=%s/%s"
             % (
+                CFG["language_pair"][0],
+                CFG["language_pair"][1],
+                CFG["source_mode"],
                 CFG["gate_dbfs"],
                 CFG["chunk_seconds"],
                 CFG["mic_gain"],
@@ -512,6 +847,9 @@ def wait_for_wifi(w, timeout_ms, accept_terminal=True):
 
     while not w.isconnected():
         M5.update()
+        service_ui()
+        if exit_requested:
+            return False
         status = w.status()
         if status != last_status:
             log("wifi: status=%s" % wifi_status_name(status))
@@ -943,7 +1281,7 @@ def save_transcript_chunk(recognized, start_seq, end_seq):
         return
     started = time.ticks_ms()
     try:
-        text, src = recognized
+        text, src, target, _turn = recognized
         start_ms = start_seq * FRAME_MS
         end_ms = end_seq * FRAME_MS
         capture_epoch = transcript_capture_epoch
@@ -963,7 +1301,7 @@ def save_transcript_chunk(recognized, start_seq, end_seq):
             "audio_end_ms": end_ms,
             "saved_elapsed_ms": time.ticks_diff(time.ticks_ms(), transcript_capture_ticks),
             "source_lang": src,
-            "target_lang": last_trans_lang,
+            "target_lang": target,
             "original": text,
             "translation": last_trans,
         }
@@ -1076,507 +1414,587 @@ def level_fraction(db, lo=-70.0, hi=-10.0):
 
 # ------------------------------------------------------------------ display
 
-
-def hit(x, y, box):
-    bx, by, bw, bh = box
-    return bx <= x < bx + bw and by <= y < by + bh
-
-
-def tap():
-    """One shot tap position, or None. M5.update() must have run this loop."""
-    if M5.Touch.getCount() == 0:
-        return None
-    d = M5.Touch.getDetail(0)
-    if d[6]:  # wasClicked
-        return (M5.Touch.getX(), M5.Touch.getY())
-    return None
+# LVGL owns the display and touch driver. Direct M5.Lcd painting is avoided so
+# touch scrolling, clipping, bidi ordering, and Arabic contextual shaping all
+# use one renderer. Keep callback closures rooted: the binding stores a C-side
+# callback pointer but MicroPython still needs the Python callable alive.
+screen_mode = "main"
+picker_slot = 0
 
 
-def press():
-    """Touch position on initial contact, without waiting for release."""
-    if M5.Touch.getCount() == 0:
-        return None
-    d = M5.Touch.getDetail(0)
-    if d[5]:  # wasPressed
-        return (M5.Touch.getX(), M5.Touch.getY())
-    return None
+def _color(value):
+    return lv.color_hex(value)
 
 
-def holding():
-    if M5.Touch.getCount() == 0:
-        return None
-    d = M5.Touch.getDetail(0)
-    if d[9]:  # isHolding
-        return (M5.Touch.getX(), M5.Touch.getY())
-    return None
+def _style_panel(obj, color=BG, radius=0):
+    obj.set_style_bg_color(_color(color), 0)
+    obj.set_style_border_width(0, 0)
+    obj.set_style_pad_all(0, 0)
+    obj.set_style_radius(radius, 0)
 
 
-def draw_gear(color=FG_DIM):
-    x, y, w, h = GEAR_BOX
-    cx, cy = x + w // 2, y + h // 2
-    r = 9
-    M5.Lcd.fillRect(x, y, w, h, BG)
-    for a in range(0, 360, 45):
+def _label(parent, text, x, y, w, color=FG_TEXT, font=None):
+    label = lv.label(parent)
+    label.set_pos(x, y)
+    label.set_width(w)
+    label.set_long_mode(lv.label.LONG_MODE.WRAP)
+    label.set_text(text)
+    label.set_style_text_color(_color(color), 0)
+    if font is not None:
+        label.set_style_text_font(font, 0)
+    return label
+
+
+def _button(parent, text, x, y, w, h, callback, color=FG_PANEL):
+    button = lv.button(parent)
+    button.set_pos(x, y)
+    button.set_size(w, h)
+    button.set_style_bg_color(_color(color), 0)
+    button.set_style_radius(7, 0)
+    button.set_style_border_width(0, 0)
+    button.set_style_pad_all(0, 0)
+    label = lv.label(button)
+    label.set_text(text)
+    label.set_style_text_color(_color(FG_TEXT), 0)
+    if font_label is not None:
+        label.set_style_text_font(font_label, 0)
+    label.center()
+    button.add_event_cb(callback, lv.EVENT.CLICKED, None)
+    return button, label
+
+
+def _load_screen(screen, callbacks):
+    global ui_screen, ui_callbacks
+    old = ui_screen
+    ui_screen = screen
+    ui_callbacks = callbacks
+    lv.screen_load(screen)
+    if old is not None and old is not screen:
         try:
-            M5.Lcd.fillArc(cx, cy, r, r + 4, a - 9, a + 9, color)
+            old.delete_async()
         except Exception:
-            break
-    M5.Lcd.fillCircle(cx, cy, r, color)
-    M5.Lcd.fillCircle(cx, cy, r // 2, BG)
+            pass
+
+
+def font_for_language(code, primary=False):
+    script_font = {
+        "ja": font_ja,
+        "ko": font_ko,
+        "zh": font_zh,
+        "ar": font_ar_translation if primary else font_ar_source,
+        "he": font_he_translation if primary else font_he_source,
+        # The bundled Japanese face includes Cyrillic and covers horizontal
+        # modern Mongolian without pretending to support vertical script.
+        "mn": font_ja,
+    }.get(code)
+    if script_font is not None:
+        return script_font
+    return font_trans_en if primary else font_label
+
+
+def style_language_label(label, code, primary=False):
+    font = font_for_language(code, primary)
+    if font is not None:
+        label.set_style_text_font(font, 0)
+    if language_profile(code)["direction"] == "rtl":
+        label.set_style_base_dir(lv.BASE_DIR.RTL, 0)
+        label.set_style_text_align(lv.TEXT_ALIGN.RIGHT, 0)
+    else:
+        label.set_style_base_dir(lv.BASE_DIR.LTR, 0)
+        label.set_style_text_align(lv.TEXT_ALIGN.LEFT, 0)
 
 
 def set_status(text, color=FG_STATUS):
+    if ui_status is None:
+        return
     try:
-        M5.Lcd.fillRect(0, 0, GEAR_BOX[0] - 2, 30, BG)
-        if font_ui is not None:
-            M5.Lcd.setFont(font_ui)
-        M5.Lcd.setTextColor(color, BG)
-        M5.Lcd.drawString(text, 6, 3)
+        ui_status.set_text(text)
+        ui_status.set_style_text_color(_color(color), 0)
     except Exception:
         pass
 
 
-def draw_frame():
-    M5.Lcd.fillScreen(BG)
-    M5.Lcd.drawLine(0, 31, W - 1, 31, FG_LINE)
-    M5.Lcd.drawLine(0, 104, W - 1, 104, FG_LINE)
-    draw_gear()
-    # The screen is blank again, so whatever the region cache believes is on
-    # it is gone. Every full clear has to forget it or the next update_display
-    # would skip both regions and leave them empty.
-    invalidate_display()
+def service_ui():
+    """Advance LVGL on the main thread instead of MicroPython's tiny queue."""
+    global ui_last_tick
+    if not ui_last_tick:
+        return
+    now = time.ticks_ms()
+    elapsed = time.ticks_diff(now, ui_last_tick)
+    if elapsed <= 0:
+        return
+    ui_last_tick = now
+    lv.tick_inc(elapsed)
+    lv.task_handler()
 
 
-# textWidth() is the only real metric this firmware offers and it costs a full
-# glyph walk, so each glyph's advance is measured once and kept. There is no
-# "which font is currently set" query on M5.Lcd, and widths differ between the
-# LCD and an off screen canvas, so the caller names both in the key.
-char_widths = {}
-CHAR_CACHE_MAX = 1500
-
-# Both text regions are double buffered through the vendor documented
-# newCanvas/push path. The canvases are allocated once and reused: allocating
-# per frame would churn the heap while the microphone FIFO is running.
-CANVAS_BPP = 16
-region_canvases = [None, None]
-canvas_ok = True
-
-# What was last actually painted into each region, so an unchanged region is
-# left alone. recognize() calls update_display() while a translation is still
-# on screen, and wiping that region to redraw identical text made it flash.
-region_state = [None, None]
+def _set_running_widgets():
+    if ui_run_label is not None:
+        ui_run_label.set_text("STOP" if running else "START")
+    if ui_pair_label is not None:
+        a, b = configured_pair()
+        ui_pair_label.set_text("%s  <->  %s" % (language_short(a), language_short(b)))
 
 
-def invalidate_display():
-    """Forget what is on screen. Call after anything clears the LCD."""
-    region_state[0] = None
-    region_state[1] = None
+def _on_feed_scroll(event):
+    global follow_latest, new_turns_while_scrolled
+    if event.code != lv.EVENT.SCROLL or ui_programmatic_scroll:
+        return
+    follow_latest = ui_feed.get_scroll_bottom() <= 4
+    if follow_latest:
+        new_turns_while_scrolled = 0
+    _update_live_button()
 
 
-def release_canvases():
-    """Give up on double buffering permanently and fall back to direct draw."""
-    global canvas_ok
-    canvas_ok = False
-    for i in range(len(region_canvases)):
-        c = region_canvases[i]
-        region_canvases[i] = None
-        if c is not None:
-            # delete() is not documented for this binding, so dropping the
-            # reference and collecting is the reliable half of the teardown.
+def _update_live_button():
+    if ui_live_button is None:
+        return
+    if follow_latest:
+        ui_live_button.add_flag(lv.obj.FLAG.HIDDEN)
+    else:
+        try:
+            # UIFlow2's LVGL binding exposes lv_obj_remove_flag(), matching
+            # LVGL 9.  Some generated examples use clear_flag(), but that
+            # method is not present on the firmware shipped for CoreS3.
+            ui_live_button.remove_flag(lv.obj.FLAG.HIDDEN)
+        except AttributeError:
+            # UIFlow2 2.5.1's shipped binding still exposes the LVGL 8 name.
+            ui_live_button.remove_flag(lv.obj.FLAG.HIDDEN)
+        ui_live_label.set_text(
+            "LIVE" if not new_turns_while_scrolled else str(new_turns_while_scrolled)
+        )
+
+
+def go_live(_event=None):
+    global follow_latest, new_turns_while_scrolled, ui_programmatic_scroll
+    follow_latest = True
+    new_turns_while_scrolled = 0
+    if ui_cards:
+        ui_programmatic_scroll = True
+        ui_cards[-1].scroll_to_view(False)
+        ui_programmatic_scroll = False
+    _update_live_button()
+
+
+def _on_run(_event):
+    global ui_action
+    ui_action = ("toggle_run",)
+
+
+def _on_language(_event):
+    global ui_action
+    ui_action = ("languages",)
+
+
+def _on_settings(_event):
+    global ui_action
+    ui_action = ("settings",)
+
+
+def _on_exit(_event):
+    """Latch an exit without doing teardown inside an LVGL callback."""
+    global ui_action, exit_requested, stop_requested
+    ui_action = ("exit",)
+    exit_requested = True
+    stop_requested = True
+
+
+def begin_turn(text, source, target):
+    global active_turn, feed_revision, new_turns_while_scrolled
+    turn = {
+        "source_text": text,
+        "translation_text": "",
+        "source": source,
+        "target": target,
+        "state": "translating",
+    }
+    turns.append(turn)
+    limit = CFG.get("history_turns", 8)
+    while len(turns) > limit:
+        evicted = turns.pop(0)
+        if ui_turn_views and ui_turn_views[0]["turn"] is evicted:
+            view = ui_turn_views.pop(0)
+            if ui_cards:
+                ui_cards.pop(0)
             try:
-                c.delete()
+                view["card"].delete()
             except Exception:
                 pass
-    char_widths.clear()
-    invalidate_display()
-    gc.collect()
+    active_turn = turn
+    feed_revision += 1
+    if not follow_latest:
+        new_turns_while_scrolled += 1
+    update_display()
+    return turn
 
 
-def region_canvas(slot, w, h):
-    """Lazily allocate one reusable off screen buffer for a text region."""
-    if not canvas_ok:
-        return None
-    c = region_canvases[slot]
-    if c is not None:
-        return c
-    try:
-        c = M5.Lcd.newCanvas(w, h, CANVAS_BPP, True)
-        # Publish it before the smoke test so a half working canvas is torn
-        # down by release_canvases() rather than leaking.
-        region_canvases[slot] = c
-        # A canvas has no .FONTS and no .COLOR of its own, so exercise exactly
-        # the calls the renderer makes, with an M5.Lcd font passed in, before
-        # trusting it with a frame.
-        c.fillScreen(BG)
-        c.setTextColor(FG_DIM, BG)
-        if font_label is not None:
-            c.setFont(font_label)
-        c.textWidth("M")
-    except Exception as e:
-        log("lcd: canvas unavailable (%r), drawing direct" % e)
-        release_canvases()
-        return None
-    return c
+def complete_turn(turn, translation):
+    global active_turn, feed_revision
+    turn["translation_text"] = translation
+    turn["state"] = "complete"
+    if active_turn is turn:
+        active_turn = None
+    feed_revision += 1
+    update_display()
 
 
-def char_width(surface, metrics, ch):
-    """Advance of one glyph on one surface, cached. -1 means no metrics."""
-    key = (metrics, ch)
-    w = char_widths.get(key, -2)
-    if w != -2:
-        return w
-    try:
-        w = surface.textWidth(ch)
-    except Exception:
-        w = -1
-    # Japanese transcripts keep introducing new glyphs, so cap the cache
-    # rather than letting it grow for the life of the session.
-    if len(char_widths) >= CHAR_CACHE_MAX:
-        char_widths.clear()
-    char_widths[key] = w
-    return w
+def fail_turn(turn, message):
+    global active_turn, feed_revision
+    turn["translation_text"] = message
+    turn["state"] = "error"
+    if active_turn is turn:
+        active_turn = None
+    feed_revision += 1
+    update_display()
 
 
-def wrap_text(text, max_px=W - 12, surface=None, metrics="lcd"):
-    """Wrap with real glyph metrics, which matters for mixed Latin and CJK.
+def _turn_card(turn):
+    card = lv.obj(ui_feed)
+    card.set_width(W - 18)
+    card.set_height(lv.SIZE_CONTENT)
+    _style_panel(card, 0x171A1D, 8)
+    card.set_flex_flow(lv.FLEX_FLOW.COLUMN)
+    card.set_style_pad_top(5, 0)
+    card.set_style_pad_bottom(7, 0)
+    card.set_style_pad_left(8, 0)
+    card.set_style_pad_right(8, 0)
+    card.set_style_pad_row(5, 0)
 
-    Widths are summed per character instead of remeasuring the whole growing
-    line. That measurement was quadratic and ran up to sixteen times a turn,
-    stalling the UI thread for hundreds of milliseconds. These are non kerned
-    bitmap faces, so the per character sum is exact.
-    """
-    if surface is None:
-        surface = M5.Lcd
-    lines = []
-    line = ""
-    width = 0
-    for ch in text:
-        if ch == "\n":
-            lines.append(line)
-            line = ""
-            width = 0
-            continue
-        w = char_width(surface, metrics, ch)
-        # w < 0 means textWidth raised, so keep the old character count rule.
-        too_wide = len(line) + 1 > 20 if w < 0 else width + w > max_px
-        if too_wide and line:
-            lines.append(line)
-            line = ch
-            width = w if w > 0 else 0
-        else:
-            line += ch
-            if w > 0:
-                width += w
-    if line:
-        lines.append(line)
-    return lines
-
-
-def lcd_safe_text(text):
-    """Replace common smart punctuation missing from some Latin font builds."""
-    for old, new in (
-        ("\u2018", "'"),
-        ("\u2019", "'"),
-        ("\u201c", '"'),
-        ("\u201d", '"'),
-        ("\u2013", "-"),
-        ("\u2014", "-"),
-        ("\u2026", "..."),
-        ("\u00a0", " "),
-    ):
-        text = text.replace(old, new)
-    return text
-
-
-def fit_lines(text, candidates, max_px, available, surface=None, metrics="lcd"):
-    """Choose the largest available font whose wrapped text fits.
-
-    Each candidate carries its own metrics key because nothing can be asked
-    which font is selected, so the width cache has to be told.
-    """
-    if surface is None:
-        surface = M5.Lcd
-    chosen_font, chosen_height, chosen_lines = candidates[-1][0], candidates[-1][1], []
-    for font, line_height, key in candidates:
-        if font is not None:
-            surface.setFont(font)
-        lines = wrap_text(text, max_px, surface, metrics + key)
-        chosen_font, chosen_height, chosen_lines = font, line_height, lines
-        if len(lines) * line_height <= available:
-            break
-    return chosen_font, chosen_height, chosen_lines
-
-
-def render_region(canvas, label_y, text_y, bottom, label, text, color, language, primary):
-    """Paint one region, into an off screen canvas when there is one.
-
-    Canvas coordinates are region relative, so every y is shifted by oy and
-    the finished buffer is pushed back at the region's real origin.
-    """
-    if canvas is None:
-        surface = M5.Lcd
-        # A canvas measures on its own glyph cache, so the LCD and each canvas
-        # get their own key space in the width cache.
-        metrics = "lcd"
-        oy = 0
-        M5.Lcd.fillRect(0, label_y, W, bottom - label_y, BG)
-    else:
-        surface = canvas
-        metrics = "c%d" % label_y
-        oy = label_y
-        canvas.fillScreen(BG)
-
-    if font_label is not None:
-        surface.setFont(font_label)
-    surface.setTextColor(FG_DIM, BG)
-    surface.drawString(label, 7, label_y - oy)
-
-    available = bottom - text_y
-    # Select the glyph set from the text itself. The transcription API has
-    # returned language="en" for clearly Japanese text on this device; using
-    # that metadata for rendering produces tofu boxes.
-    text_language = detect_source(text) if text else language
-    shown_text = lcd_safe_text(text)
-    if text_language == "ja":
-        candidates = ((font_ja, 26, "ja24"),)
-    elif primary:
-        candidates = (
-            (font_trans_en, 28, "m24"),
-            (font_source_en, 22, "m18"),
-            (font_ui, 19, "m16"),
-            (font_label, 15, "m12"),
-        )
-    else:
-        candidates = ((font_source_en, 22, "m18"), (font_ui, 19, "m16"), (font_label, 15, "m12"))
-    font, line_height, lines = fit_lines(
-        shown_text or "...", candidates, W - 14, available, surface, metrics
-    )
-    if font is not None:
-        surface.setFont(font)
-    surface.setTextColor(color if text else FG_DIM, BG)
-    y = text_y - oy
-    visible = available // line_height
-    for line in lines[:visible]:
-        surface.drawString(line, 7, y)
-        y += line_height
-    if canvas is not None:
-        canvas.push(0, label_y)
-
-
-def draw_labeled_region(slot, label_y, text_y, bottom, label, text, color, language, primary):
-    state = (label, text, color, label_y, text_y, bottom)
-    if region_state[slot] == state:
-        return
-    # Clear first: a failure part way through leaves the region dirty, and the
-    # cache must not claim it is clean.
-    region_state[slot] = None
-    canvas = region_canvas(slot, W, bottom - label_y)
-    if canvas is not None:
-        try:
-            render_region(canvas, label_y, text_y, bottom, label, text, color, language, primary)
-            region_state[slot] = state
-            return
-        except Exception as e:
-            # Never let the buffered path take the screen down with it.
-            log("lcd: canvas draw failed %r, drawing direct" % e)
-            release_canvases()
-    render_region(None, label_y, text_y, bottom, label, text, color, language, primary)
-    region_state[slot] = state
-
-
-def update_display():
-    target = last_trans_lang if last_trans else ("ja" if last_src == "en" else "en")
-    draw_labeled_region(
+    source = turn["source"]
+    target = turn["target"]
+    _label(
+        card,
+        "%s -> %s" % (language_short(source), language_short(target)),
+        8,
         0,
-        35,
-        50,
-        103,
-        "HEARD  %s" % last_src.upper(),
-        last_orig,
-        FG_ORIG,
-        last_src,
-        False,
+        W - 42,
+        FG_DIM,
+        font_label,
     )
-    draw_labeled_region(
-        1,
-        108,
-        124,
-        239,
-        "TRANSLATION  %s" % target.upper(),
-        last_trans,
-        FG_TRANS,
-        target,
-        True,
+    source_label = _label(card, turn["source_text"], 8, 0, W - 42, FG_ORIG)
+    style_language_label(source_label, source)
+
+    translated = turn["translation_text"]
+    if not translated:
+        translated = "Translating..."
+    trans_color = FG_ALERT if turn["state"] == "error" else FG_TRANS
+    trans_label = _label(card, translated, 8, 0, W - 42, trans_color)
+    if turn["translation_text"]:
+        style_language_label(trans_label, target, True)
+    elif font_label is not None:
+        # The placeholder is Latin UI chrome. Avoid walking a multi-megabyte
+        # CJK face before there is any translated CJK text to draw.
+        trans_label.set_style_text_font(font_label, 0)
+    return {
+        "turn": turn,
+        "card": card,
+        "translation_label": trans_label,
+        "painted_translation": translated,
+        "painted_state": turn["state"],
+    }
+
+
+def update_display(force=False):
+    global feed_painted_revision, ui_cards, ui_turn_views, ui_programmatic_scroll
+    if screen_mode != "main" or ui_feed is None:
+        return
+    if not force and feed_painted_revision == feed_revision:
+        return
+
+    rebuild = force or len(ui_turn_views) > len(turns)
+    if not rebuild:
+        for index, view in enumerate(ui_turn_views):
+            if view["turn"] is not turns[index]:
+                rebuild = True
+                break
+    if rebuild:
+        ui_feed.clean()
+        ui_cards = []
+        ui_turn_views = []
+
+    if not turns and not ui_turn_views:
+        hint = _label(ui_feed, "Choose languages, then tap START", 12, 46, W - 36, FG_DIM, font_ui)
+        hint.set_style_text_align(lv.TEXT_ALIGN.CENTER, 0)
+    else:
+        if not ui_turn_views:
+            ui_feed.clean()
+        for turn in turns[len(ui_turn_views) :]:
+            view = _turn_card(turn)
+            ui_turn_views.append(view)
+            ui_cards.append(view["card"])
+        for view in ui_turn_views:
+            turn = view["turn"]
+            translated = turn["translation_text"] or "Translating..."
+            if translated != view["painted_translation"] or turn["state"] != view["painted_state"]:
+                view["translation_label"].set_text(translated)
+                style_language_label(view["translation_label"], turn["target"], True)
+                color = FG_ALERT if turn["state"] == "error" else FG_TRANS
+                view["translation_label"].set_style_text_color(_color(color), 0)
+                view["painted_translation"] = translated
+                view["painted_state"] = turn["state"]
+    feed_painted_revision = feed_revision
+    if follow_latest and ui_cards:
+        ui_programmatic_scroll = True
+        ui_cards[-1].scroll_to_view(False)
+        ui_programmatic_scroll = False
+    _update_live_button()
+
+
+def show_main_screen():
+    global screen_mode, ui_feed, ui_status, ui_pair_label
+    global ui_run_label, ui_live_button, ui_live_label, feed_painted_revision
+    screen_mode = "main"
+    callbacks = [_on_feed_scroll, _on_run, _on_language, _on_settings, _on_exit, go_live]
+    screen = lv.obj()
+    screen.set_size(W, H)
+    _style_panel(screen)
+
+    ui_status = _label(screen, "Ready", 6, 13, EXIT_BOX[0] - 12, FG_STATUS, font_label)
+    exit_button, _ = _button(
+        screen,
+        "EXIT",
+        EXIT_BOX[0],
+        EXIT_BOX[1],
+        EXIT_BOX[2],
+        EXIT_BOX[3],
+        _on_exit,
+        0x5A2323,
+    )
+    exit_button.set_style_radius(0, 0)
+    ui_feed = lv.obj(screen)
+    ui_feed.set_pos(0, VIEW_Y)
+    ui_feed.set_size(W, VIEW_H)
+    _style_panel(ui_feed)
+    ui_feed.set_scroll_dir(lv.DIR.VER)
+    ui_feed.set_flex_flow(lv.FLEX_FLOW.COLUMN)
+    ui_feed.set_style_pad_all(4, 0)
+    ui_feed.set_style_pad_row(6, 0)
+    ui_feed.add_event_cb(_on_feed_scroll, lv.EVENT.SCROLL, None)
+
+    pair_button, ui_pair_label = _button(
+        screen, "", LANGUAGE_BOX[0], LANGUAGE_BOX[1], LANGUAGE_BOX[2], LANGUAGE_BOX[3], _on_language
+    )
+    pair_button.set_style_radius(0, 0)
+    run_button, ui_run_label = _button(
+        screen, "START", RUN_BOX[0], RUN_BOX[1], RUN_BOX[2], RUN_BOX[3], _on_run, FG_ACTIVE
+    )
+    run_button.set_style_radius(0, 0)
+    ui_live_button, ui_live_label = _button(
+        screen, "LIVE", LIVE_BOX[0], LIVE_BOX[1], LIVE_BOX[2], LIVE_BOX[3], go_live, 0x225E45
+    )
+    ui_live_button.set_style_radius(0, 0)
+    settings_button, _ = _button(
+        screen,
+        "SET",
+        GEAR_HIT_BOX[0],
+        GEAR_HIT_BOX[1],
+        GEAR_HIT_BOX[2],
+        GEAR_HIT_BOX[3],
+        _on_settings,
+    )
+    settings_button.set_style_radius(0, 0)
+    _load_screen(screen, callbacks)
+    _set_running_widgets()
+    feed_painted_revision = -1
+    update_display(True)
+
+
+def _select_picker_slot(slot):
+    global ui_action
+    ui_action = ("picker_slot", slot)
+
+
+def _select_language(code):
+    global ui_action
+    ui_action = ("pick_language", code)
+
+
+def _done_language(_event=None):
+    global ui_action
+    ui_action = ("main",)
+
+
+def language_page():
+    global screen_mode, ui_status, ui_feed, ui_pair_label, ui_run_label
+    global ui_live_button, ui_live_label
+    screen_mode = "language"
+    ui_feed = ui_pair_label = ui_run_label = ui_live_button = ui_live_label = None
+    callbacks = []
+    screen = lv.obj()
+    screen.set_size(W, H)
+    _style_panel(screen)
+    ui_status = _label(
+        screen, "Choose language %s" % (picker_slot + 1), 8, 8, 160, FG_STATUS, font_label
     )
 
+    for slot, x in ((0, 174), (1, 248)):
 
-# ------------------------------------------------------------------ settings
+        def choose_slot(_event, selected=slot):
+            _select_picker_slot(selected)
 
+        callbacks.append(choose_slot)
+        color = FG_ACTIVE if slot == picker_slot else FG_PANEL
+        _button(screen, language_short(configured_pair()[slot]), x, 0, 72, 44, choose_slot, color)
 
-class Meter:
-    """Horizontal bar that only repaints the pixels that changed, so no flicker."""
+    positions = ((4, 48), (108, 48), (212, 48), (4, 94), (108, 94), (212, 94), (4, 140))
+    for code, pos in zip(LANGUAGE_CODES, positions):
 
-    def __init__(self, x, y, w, h):
-        self.x, self.y, self.w, self.h = x, y, w, h
-        self.prev = 0
-        self.mark = -1
+        def choose_language(_event, selected=code):
+            _select_language(selected)
 
-    def frame(self):
-        M5.Lcd.drawRect(self.x - 1, self.y - 1, self.w + 2, self.h + 2, FG_DIM)
-        self.prev = 0
-        M5.Lcd.fillRect(self.x, self.y, self.w, self.h, BG)
+        callbacks.append(choose_language)
+        color = FG_ACTIVE if code in configured_pair() else FG_PANEL
+        _button(
+            screen, LANGUAGE_PROFILES[code]["name"], pos[0], pos[1], 100, 44, choose_language, color
+        )
 
-    def set_mark(self, frac):
-        """Draw the gate threshold as a tick inside the bar."""
-        if self.mark >= 0:
-            M5.Lcd.fillRect(self.x + self.mark, self.y, 1, self.h, BG)
-        self.mark = int(self.w * frac)
-        if self.mark >= self.w:
-            self.mark = self.w - 1
-        M5.Lcd.fillRect(self.x + self.mark, self.y, 1, self.h, FG_ALERT)
-
-    def set(self, frac, color):
-        n = int(self.w * frac)
-        if n > self.w:
-            n = self.w
-        if n > self.prev:
-            M5.Lcd.fillRect(self.x + self.prev, self.y, n - self.prev, self.h, color)
-        elif n < self.prev:
-            M5.Lcd.fillRect(self.x + n, self.y, self.prev - n, self.h, BG)
-        self.prev = n
-        if self.mark >= 0 and self.mark < self.w:
-            M5.Lcd.fillRect(self.x + self.mark, self.y, 1, self.h, FG_ALERT)
+    callbacks.append(_done_language)
+    _button(screen, "DONE", 108, 140, 204, 44, _done_language, 0x225E45)
+    rtl_ready = (
+        rtl_firmware_abi == 2
+        and font_ar_source is not None
+        and font_ar_translation is not None
+        and font_he_source is not None
+        and font_he_translation is not None
+    )
+    note = "RTL firmware: OK" if rtl_ready else "Arabic/Hebrew need RTL firmware"
+    _label(screen, note, 8, 198, W - 16, FG_DIM, font_label)
+    _load_screen(screen, callbacks)
 
 
-def draw_stepper(y, label, value, unit):
-    M5.Lcd.fillRect(0, y, 206, 30, BG)
-    M5.Lcd.setTextColor(FG_TEXT, BG)
-    M5.Lcd.drawString("%s %d%s" % (label, value, unit), 10, y + 5)
-    for bx, up in ((214, False), (266, True)):
-        M5.Lcd.fillRoundRect(bx, y, 44, 30, 6, FG_PANEL)
-        cx, cy = bx + 22, y + 15
-        if up:
-            M5.Lcd.fillTriangle(cx, cy - 7, cx - 8, cy + 5, cx + 8, cy + 5, FG_TEXT)
-        else:
-            M5.Lcd.fillTriangle(cx, cy + 7, cx - 8, cy - 5, cx + 8, cy - 5, FG_TEXT)
-
-
-ROW_Y = (80, 116, 152)
-ROWS = (
+SETTINGS_ROWS = (
     ("Gate", "gate_dbfs", " dB", GATE_MIN, GATE_MAX),
     ("Chunk", "chunk_seconds", " s", CHUNK_MIN, CHUNK_MAX),
     ("Gain", "mic_gain", "x", GAIN_MIN, GAIN_MAX),
 )
-BACK_BOX = (10, 194, 120, 34)
-SD_SAVE_BOX = (140, 194, 170, 34)
 
 
-def draw_sd_toggle():
-    enabled = CFG["save_transcripts"]
-    color = FG_TRANS if enabled else FG_PANEL
-    M5.Lcd.fillRoundRect(SD_SAVE_BOX[0], SD_SAVE_BOX[1], SD_SAVE_BOX[2], SD_SAVE_BOX[3], 8, color)
-    M5.Lcd.setTextColor(BG if enabled else FG_TEXT, color)
-    label = "SD Save %s" % ("ON" if enabled else "OFF")
-    M5.Lcd.drawString(label, SD_SAVE_BOX[0] + 24, SD_SAVE_BOX[1] + 7)
+def _change_setting(key, delta, lo, hi):
+    global ui_action
+    ui_action = ("setting", key, delta, lo, hi)
+
+
+def _toggle_sd(_event=None):
+    global ui_action
+    ui_action = ("toggle_sd",)
 
 
 def settings_page():
-    """Live meters, audio tunables, and the optional SD transcript toggle."""
-    global last_level
+    global screen_mode, ui_status, ui_feed, ui_pair_label, ui_run_label
+    global ui_live_button, ui_live_label
+    screen_mode = "settings"
+    ui_feed = ui_pair_label = ui_run_label = ui_live_button = ui_live_label = None
+    callbacks = [_done_language, _toggle_sd]
+    screen = lv.obj()
+    screen.set_size(W, H)
+    _style_panel(screen)
+    ui_status = _label(screen, "Audio and storage", 8, 12, 210, FG_STATUS, font_label)
+    _button(screen, "BACK", 228, 0, 92, 44, _done_language, FG_PANEL)
 
-    if font_ui is not None:
-        M5.Lcd.setFont(font_ui)
-    M5.Lcd.fillScreen(BG)
-    M5.Lcd.setTextColor(FG_TEXT, BG)
-    M5.Lcd.drawString("Settings", 10, 2)
-    M5.Lcd.drawLine(0, 24, W - 1, 24, FG_LINE)
+    for index, row in enumerate(SETTINGS_ROWS):
+        label, key, unit, lo, hi = row
+        y = 44 + index * 44
+        _label(screen, "%s  %d%s" % (label, CFG[key], unit), 10, y + 13, 210, FG_TEXT, font_ui)
 
-    M5.Lcd.setTextColor(FG_DIM, BG)
-    M5.Lcd.drawString("MIC 1", 10, 32)
-    M5.Lcd.drawString("MIC 2", 10, 56)
-    left = Meter(70, 32, 240, 16)
-    right = Meter(70, 56, 240, 16)
-    left.frame()
-    right.frame()
+        def down(_event, k=key, low=lo, high=hi):
+            _change_setting(k, -1, low, high)
 
-    gate_frac = level_fraction(CFG["gate_dbfs"])
-    left.set_mark(gate_frac)
-    right.set_mark(gate_frac)
+        def up(_event, k=key, low=lo, high=hi):
+            _change_setting(k, 1, low, high)
 
-    for y, row in zip(ROW_Y, ROWS):
-        draw_stepper(y, row[0], CFG[row[1]], row[2])
+        callbacks.extend((down, up))
+        _button(screen, "-", 228, y, 44, 44, down)
+        _button(screen, "+", 276, y, 44, 44, up)
 
-    M5.Lcd.fillRoundRect(BACK_BOX[0], BACK_BOX[1], BACK_BOX[2], BACK_BOX[3], 8, FG_PANEL)
-    M5.Lcd.setTextColor(FG_TEXT, FG_PANEL)
-    M5.Lcd.drawString("Back", BACK_BOX[0] + 34, BACK_BOX[1] + 7)
-    draw_sd_toggle()
+    sd_color = 0x225E45 if CFG["save_transcripts"] else FG_PANEL
+    _button(
+        screen,
+        "SD TRANSCRIPT  " + ("ON" if CFG["save_transcripts"] else "OFF"),
+        8,
+        181,
+        304,
+        52,
+        _toggle_sd,
+        sd_color,
+    )
+    _load_screen(screen, callbacks)
 
-    # M5.Mic's persistent task accepts arbitrary buffer lengths. A 150 ms
-    # stereo frame gives responsive independent meters for the two real mics.
-    meter_frames = int(SAMPLE_RATE * 0.15)
-    frame = bytearray(meter_frames * 2 * 2)
-    dirty = False
-    repeat_at = 0
 
-    while True:
-        M5.update()
-        tap_pos = tap()
-        pos = tap_pos
-        if pos is None:
-            held = holding()
-            now = time.ticks_ms()
-            if held and time.ticks_diff(now, repeat_at) > 0:
-                pos = held
-                repeat_at = time.ticks_add(now, 150)
+def process_ui_action():
+    """Apply one LVGL request on the main thread, outside event callbacks."""
+    global ui_action, running, stop_requested, fatal
+    global settings_requested, language_requested, picker_slot
+
+    action = ui_action
+    if action is None:
+        return False
+    ui_action = None
+    kind = action[0]
+    if kind == "exit":
+        running = False
+        stop_requested = True
+        set_status("Exiting...", FG_DIM)
+    elif kind == "toggle_run":
+        if running:
+            running = False
+            stop_requested = True
+            set_status("Stopping...", FG_DIM)
         else:
-            repeat_at = time.ticks_add(time.ticks_ms(), 400)
-
-        if pos:
-            x, y = pos
-            if hit(x, y, BACK_BOX):
-                break
-            if tap_pos is not None and hit(x, y, SD_SAVE_BOX):
-                CFG["save_transcripts"] = not CFG["save_transcripts"]
-                dirty = True
-                draw_sd_toggle()
-                continue
-            for ry, row in zip(ROW_Y, ROWS):
-                label, key, unit, lo, hi = row
-                down = (214, ry, 44, 30)
-                up = (266, ry, 44, 30)
-                if not (hit(x, y, up) or hit(x, y, down)):
-                    continue
-                v = CFG[key] + (1 if hit(x, y, up) else -1)
-                if lo <= v <= hi:
-                    CFG[key] = v
-                    dirty = True
-                    draw_stepper(ry, label, v, unit)
-                    if key == "gate_dbfs":
-                        f = level_fraction(v)
-                        left.set_mark(f)
-                        right.set_mark(f)
-                break
-
-        try:
-            if not M5.Mic.record(frame, SAMPLE_RATE, True):
-                raise RuntimeError("mic queue failed")
-            while M5.Mic.isRecording():
-                time.sleep_ms(10)
-            d1 = channel_dbfs(frame, 0, 2)
-            d2 = channel_dbfs(frame, 1, 2)
-        except Exception:
-            d1 = d2 = -99.0
-        last_level = d1
-        gate = CFG["gate_dbfs"]
-        left.set(level_fraction(d1), FG_TRANS if d1 >= gate else FG_STATUS)
-        right.set(level_fraction(d2), FG_TRANS if d2 >= gate else FG_STATUS)
-
-    if dirty:
+            error = pair_render_error()
+            if error:
+                set_status(error, FG_ALERT)
+            elif screen_mode == "main":
+                fatal = ""
+                running = True
+                set_status("Starting...")
+        _set_running_widgets()
+        log("ui: running=%s" % running)
+    elif kind in ("settings", "languages"):
+        if kind == "settings":
+            settings_requested = True
+        else:
+            language_requested = True
+        if running:
+            running = False
+            stop_requested = True
+            set_status("Opening %s..." % kind, FG_DIM)
+        elif kind == "settings":
+            settings_requested = False
+            settings_page()
+        else:
+            language_requested = False
+            language_page()
+    elif kind == "picker_slot":
+        picker_slot = action[1]
+        language_page()
+    elif kind == "pick_language":
+        pair = list(configured_pair())
+        other = 1 - picker_slot
+        if pair[other] == action[1]:
+            pair[other] = pair[picker_slot]
+        pair[picker_slot] = action[1]
+        CFG["language_pair"] = pair
+        picker_slot = other
         save_config()
-    if font_ja is not None:
-        M5.Lcd.setFont(font_ja)
-    draw_frame()
-    update_display()
+        language_page()
+    elif kind == "setting":
+        key, delta, lo, hi = action[1:]
+        value = CFG[key] + delta
+        if lo <= value <= hi:
+            CFG[key] = value
+            if key == "mic_gain":
+                configure_mic()
+            save_config()
+        settings_page()
+    elif kind == "toggle_sd":
+        CFG["save_transcripts"] = not CFG["save_transcripts"]
+        save_config()
+        settings_page()
+    elif kind == "main":
+        show_main_screen()
+        error = pair_render_error()
+        set_status(error if error else "Languages ready", FG_ALERT if error else FG_STATUS)
+    return True
 
 
 # ------------------------------------------------------------------ audio
@@ -1586,7 +2004,9 @@ def settings_page():
 # utterance ends when the talker stops rather than when a wall clock expires.
 # One second per frame keeps the endpointer responsive while still leaving two
 # seconds of runway in the FIFO if the UI thread stalls on a repaint.
-FRAME_MS = 1000
+# A 500 ms buffer keeps one second of native FIFO runway while cutting the
+# endpoint's observation delay in half versus the old one-second buffers.
+FRAME_MS = 500
 FRAME_BYTES = SAMPLE_RATE * 2 * FRAME_MS // 1000
 
 # Levels are measured once per window as each frame lands. The same numbers
@@ -1620,6 +2040,9 @@ TRIM_GUARD_BYTES = SAMPLE_RATE * 2 * TRIM_GUARD_MS // 1000
 # every turn, a fresh 192 KB object that the multipart build then copied
 # again. M5.Mic never sees a pointer to a pooled buffer.
 UPLOAD_POOL = 2
+# Absorb cloud jitter without dropping the oldest untranslated speech. The S3
+# has ample PSRAM; ten seconds costs 320 KB of mono PCM at 16 kHz.
+RING_BACKLOG_MS = 10000
 
 # Session state for the ring and the endpointer. These live here rather than
 # in the module wide globals block because they are only meaningful while a
@@ -1669,48 +2092,12 @@ def wav_header(n):
     )
 
 
-@micropython.viper
-def _gain_inplace(buf: ptr16, n: int, g: int):  # noqa: F821
-    """Saturating integer gain, in place, no allocation.
-
-    Viper ptr16 loads are unsigned so each sample is sign extended by hand,
-    and the result is clamped rather than allowed to wrap. A wrap would turn a
-    loud peak into a full scale spike, which is far worse for the model than
-    clipping.
-    """
-    i = 0
-    while i < n:
-        v = int(buf[i])
-        if v > 32767:
-            v -= 65536
-        v = v * g
-        if v > 32767:
-            v = 32767
-        elif v < -32768:
-            v = -32768
-        buf[i] = v
-        i += 1
-
-
-def apply_gain(buf, nbytes=None):
-    """Gain the first nbytes of buf in place, defaulting to the whole buffer.
-
-    The upload buffers are pooled at the maximum utterance length, so a
-    trimmed utterance only fills a prefix and only that prefix is worth the
-    viper pass. The buffer itself stays a plain bytearray starting at offset
-    zero, which is what ptr16 wants.
-    """
-    g = int(CFG["mic_gain"])
-    if g <= 1:
-        return
-    n = len(buf) if nbytes is None else nbytes
-    t0 = time.ticks_ms()
-    try:
-        _gain_inplace(buf, n // 2, g)
-    except Exception as e:
-        log("gain: failed %r" % e)
-        return
-    log("gain: x%d over %d samples in %d ms" % (g, n // 2, time.ticks_diff(time.ticks_ms(), t0)))
+def normalized_mic_db(value):
+    """Keep the existing gate/meter scale after moving gain into native I2S."""
+    gain = int(CFG["mic_gain"])
+    if value <= -99.0 or gain <= 1:
+        return value
+    return value - 20.0 * math.log(gain, 10)
 
 
 def boost_analog_gain(code):
@@ -1738,7 +2125,10 @@ def configure_mic():
     M5.Mic.end()
     M5.Mic.config(
         sample_rate=SAMPLE_RATE,
-        magnification=2,
+        # M5Unified applies this inside its native I2S task. Base 2 preserves
+        # the old raw capture; multiplying here replaces the 86-175 ms Python
+        # gain pass without changing the uploaded signal level.
+        magnification=2 * int(CFG["mic_gain"]),
         task_pinned_core=0,
     )
     if not M5.Mic.begin():
@@ -1772,6 +2162,7 @@ def drain_captures():
     """Let queued raw pointers finish before their Python buffers are freed."""
     while M5.Mic.isRecording():
         M5.update()
+        service_ui()
         time.sleep_ms(20)
 
 
@@ -1788,9 +2179,12 @@ def analyze_frame(pcm, rms_out, peak_out):
     channel_dbfs and channel_peak_dbfs each walk the buffer separately. The
     pump needs both numbers for every frame, so this makes one strided pass
     and fills two preallocated lists, which also keeps per frame allocation at
-    zero. Roughly 4000 iterations for a one second frame, once per second.
+    zero. Sampling one quarter of the PCM costs roughly 4000 iterations per
+    second regardless of the capture frame size.
     """
     stride = 2 * LEVEL_STEP
+    gain = int(CFG["mic_gain"])
+    gain_db = 20.0 * math.log(gain, 10) if gain > 1 else 0.0
     base = 0
     w = 0
     while w < WINS_PER_FRAME:
@@ -1810,8 +2204,10 @@ def analyze_frame(pcm, rms_out, peak_out):
             total += v * v
             n += 1
             i += stride
-        rms_out[w] = dbfs(math.sqrt(total / n)) if n else -99.0
-        peak_out[w] = dbfs(peak)
+        rms_value = (dbfs(math.sqrt(total / n)) if n else -99.0) - gain_db
+        peak_value = dbfs(peak) - gain_db
+        rms_out[w] = rms_value if rms_value > -99.0 else -99.0
+        peak_out[w] = peak_value if peak_value > -99.0 else -99.0
         base = end
         w += 1
 
@@ -1834,26 +2230,42 @@ def utterance_max_seconds():
     return s
 
 
-def begin_capture():
-    """Allocate the frame ring and hand M5.Mic its first two slots."""
+def prepare_capture_storage():
+    """Allocate reusable PSRAM storage before the interactive UI starts."""
     global capture_buffers, capture_views, ring_rms, ring_peak
-    global ring_slots, max_frames, upload_pool, upload_slot
+    global ring_slots, max_frames, upload_pool
+
+    wanted_max = utterance_max_seconds() * 1000 // FRAME_MS
+    wanted_slots = wanted_max + RING_BACKLOG_MS // FRAME_MS
+    if (
+        capture_buffers is not None
+        and ring_slots == wanted_slots
+        and max_frames == wanted_max
+        and upload_pool is not None
+    ):
+        return
+    capture_buffers = [bytearray(FRAME_BYTES) for _ in range(wanted_slots)]
+    capture_views = [memoryview(buf) for buf in capture_buffers]
+    ring_rms = [[-99.0] * WINS_PER_FRAME for _ in range(wanted_slots)]
+    ring_peak = [[-99.0] * WINS_PER_FRAME for _ in range(wanted_slots)]
+    upload_pool = [bytearray(wanted_max * FRAME_BYTES) for _ in range(UPLOAD_POOL)]
+    ring_slots = wanted_slots
+    max_frames = wanted_max
+    log(
+        "pipeline: prepared ring %d x %d bytes, upload %d x %d bytes"
+        % (ring_slots, FRAME_BYTES, UPLOAD_POOL, max_frames * FRAME_BYTES)
+    )
+
+
+def begin_capture():
+    """Reset the reusable frame ring and hand M5.Mic its first two slots."""
+    global upload_slot
     global head_seq, tail_seq, open_seq, pending_ends
     global speech_windows, silence_run
     global pump_armed, pump_busy, pump_last_ms
     global starved_logged, stalled_logged, overflow_logged, pump_error_logged
 
-    max_frames = utterance_max_seconds() * 1000 // FRAME_MS
-    # One finished utterance can be waiting on the network while the next one
-    # is still being spoken, so the ring holds both plus a little slack.
-    ring_slots = max_frames + 6
-    capture_buffers = [bytearray(FRAME_BYTES) for _ in range(ring_slots)]
-    # Built once so copying a frame into the upload buffer never allocates a
-    # temporary slice of the audio.
-    capture_views = [memoryview(b) for b in capture_buffers]
-    ring_rms = [[-99.0] * WINS_PER_FRAME for _ in range(ring_slots)]
-    ring_peak = [[-99.0] * WINS_PER_FRAME for _ in range(ring_slots)]
-    upload_pool = [bytearray(max_frames * FRAME_BYTES) for _ in range(UPLOAD_POOL)]
+    prepare_capture_storage()
     upload_slot = 0
     head_seq = 0
     tail_seq = 0
@@ -1869,7 +2281,7 @@ def begin_capture():
     pump_error_logged = False
 
     log(
-        "pipeline: ring %d x %d bytes, upload %d x %d bytes, utterance max %d s"
+        "pipeline: armed ring %d x %d bytes, upload %d x %d bytes, utterance max %d s"
         % (
             ring_slots,
             FRAME_BYTES,
@@ -1885,25 +2297,21 @@ def begin_capture():
 
 
 def end_capture():
-    """Stop requeueing, let the two raw pointers finish, then drop the ring.
+    """Stop requeueing and let the two raw pointers finish.
 
     M5.Mic.end() waits for an in flight buffer instead of cancelling it, and
     the FIFO stores raw pointers, so every ring slot has to stay rooted until
-    isRecording() reaches zero.
+    isRecording() reaches zero. The storage stays allocated for the next run.
     """
-    global capture_buffers, capture_views, ring_rms, ring_peak
-    global upload_pool, pending_ends, pump_armed
+    global pending_ends, pump_armed
 
     pump_armed = False
     if M5.Mic.isRecording():
         set_status("Finishing queued audio...", FG_DIM)
         drain_captures()
-    capture_buffers = None
-    capture_views = None
-    ring_rms = None
-    ring_peak = None
-    upload_pool = None
     pending_ends = None
+    if _log_rotation_deferred:
+        _rotate_log()
 
 
 def report_starvation():
@@ -2202,6 +2610,18 @@ def join_exact(parts):
         return out
 
 
+class BodyParts:
+    """Deferred HTTP body used to keep large PCM copies off the capture loop."""
+
+    def __init__(self, parts):
+        self.parts = tuple(parts)
+        self.length = sum(len(part) for part in self.parts)
+
+
+def body_length(body):
+    return body.length if isinstance(body, BodyParts) else len(body) if body else 0
+
+
 class KeepAliveHeaders:
     """Case-insensitive header map. post_with_retry asks for two spellings."""
 
@@ -2365,6 +2785,13 @@ class KeepAliveClient:
                 raise ConnectionLost("write returned %r" % n)
             sent += n
 
+    def _send_body(self, body):
+        if isinstance(body, BodyParts):
+            for part in body.parts:
+                self._send_all(part)
+        elif body:
+            self._send_all(body)
+
     def _readline(self):
         try:
             line = self.sock.readline()
@@ -2470,7 +2897,7 @@ class KeepAliveClient:
     # -- requests --------------------------------------------------------
 
     def _build_head(self, method, host, port, path, body, headers):
-        length = len(body) if body else 0
+        length = body_length(body)
         host_header = host if port == KEEPALIVE_DEFAULT_PORT else "%s:%d" % (host, port)
         lines = [
             "%s %s HTTP/1.1" % (method, path),
@@ -2549,8 +2976,7 @@ class KeepAliveClient:
                     self._connect(host, port)
                     t0 = time.ticks_ms()
                 self._send_all(head)
-                if body:
-                    self._send_all(body)
+                self._send_body(body)
                 status, resp_headers, close_after = self._read_head()
             except Exception as e:
                 self._close()
@@ -2621,28 +3047,33 @@ def poll_session_controls():
     during a slow turn, the mic goes idle, and audio is dropped while the
     status still reads Listening.
     """
-    global running, settings_requested
+    global running, stop_requested
 
     M5.update()
+    service_ui()
     service_capture()
+    process_ui_action()
     power = BtnPWR.wasClicked()
-    pos = press()
-    if not power and pos is None:
+    if not power and not stop_requested:
         return False
 
     running = False
-    if pos and hit(pos[0], pos[1], GEAR_HIT_BOX):
-        settings_requested = True
-        set_status("Opening settings...", FG_DIM)
-        log("touch: settings requested")
-    else:
+    stop_requested = False
+    if exit_requested:
+        set_status("Exiting...", FG_DIM)
+    elif not settings_requested and not language_requested:
         set_status("Stopping...", FG_DIM)
-        log("touch: stop requested")
+    log("ui: stop requested")
+    _set_running_widgets()
     return True
 
 
 def _requests2_post(url, kw):
-    """requests2 accepts an undocumented timeout=, fall back if it ever stops."""
+    """requests2 fallback; materialize deferred body parts on the worker."""
+    data = kw.get("data")
+    if isinstance(data, BodyParts):
+        kw = dict(kw)
+        kw["data"] = join_exact(data.parts)
     try:
         return requests2.post(url, timeout=HTTP_TIMEOUT, **kw)
     except TypeError:
@@ -2785,6 +3216,10 @@ def post_with_retry(label, make_post, attempts=3):
         if err is None:
             return r
         log("%s: status=%d %s" % (label, err.status, err.body))
+        try:
+            r.close()
+        except Exception:
+            pass
         if not err.retryable or attempt == attempts - 1:
             raise err
         wait = delay
@@ -2815,29 +3250,139 @@ def auth_headers(extra=None):
 # ------------------------------------------------------------------ OpenAI
 
 
+# The embedded Cairo and Noto Sans Hebrew subsets stop at U+007E on the Latin
+# side, so every typographic character the models emit has no glyph. LVGL then
+# takes the placeholder path in lv_font_get_glyph_dsc_internal(), which sets
+# box_w to half the line height and draws an empty rectangle. A curly
+# apostrophe inside an English contraction therefore shows up as a box between
+# two letters. Widening the generated ranges would be the other fix, but the
+# application partition has under 50 KB of headroom, so fold these onto the
+# ASCII the subsets already carry instead.
+GLYPH_SUBSTITUTIONS = {
+    0x2018: "'",
+    0x2019: "'",
+    0x201A: "'",
+    0x201B: "'",
+    0x201C: '"',
+    0x201D: '"',
+    0x201E: '"',
+    0x201F: '"',
+    0x2039: "'",
+    0x203A: "'",
+    0x00AB: '"',
+    0x00BB: '"',
+    0x2010: "-",
+    0x2011: "-",
+    0x2012: "-",
+    0x2013: "-",
+    0x2014: "-",
+    0x2015: "-",
+    0x2212: "-",
+    0x2026: "...",
+    0x2022: "*",
+    0x00B7: ".",
+    0x2027: ".",
+    0x00A0: " ",
+    0x202F: " ",
+    0x2007: " ",
+    0x2008: " ",
+    0x2009: " ",
+    0x200A: " ",
+    0x2005: " ",
+    0x2003: " ",
+    0x2002: " ",
+    0x00B0: " ",
+    0x2032: "'",
+    0x2033: '"',
+}
+
+# Invisible formatting codes. LVGL has no glyph for any of them, so each one
+# would also draw a box. They are dropped rather than substituted because the
+# app already keeps canonical logical-order text in Python and lets LVGL do the
+# BiDi run resolution, so an explicit direction override is not wanted here.
+GLYPH_DROPPED = frozenset(
+    (
+        0x061C,
+        0x200B,
+        0x200C,
+        0x200D,
+        0x200E,
+        0x200F,
+        0x202A,
+        0x202B,
+        0x202C,
+        0x202D,
+        0x202E,
+        0x2066,
+        0x2067,
+        0x2068,
+        0x2069,
+        0xFEFF,
+    )
+)
+
+
+def renderable_text(text):
+    """Fold model output onto code points the embedded subsets can draw.
+
+    Anything left unmapped is passed through unchanged, so Arabic, Hebrew, and
+    CJK are untouched. Only characters that would otherwise render as an empty
+    placeholder box are rewritten.
+    """
+    if not text:
+        return text
+    out = []
+    changed = False
+    for ch in text:
+        code = ord(ch)
+        if code < 0x80:
+            out.append(ch)
+            continue
+        if code in GLYPH_DROPPED:
+            changed = True
+            continue
+        sub = GLYPH_SUBSTITUTIONS.get(code)
+        if sub is None:
+            out.append(ch)
+        else:
+            out.append(sub)
+            changed = True
+    return "".join(out) if changed else text
+
+
 def transcribe(pcm):
     """Upload PCM as a multipart WAV. Returns (text, language_code_or_empty).
 
     The WAV header goes straight into the body rather than building a separate
     WAV first, which avoids a second full sized copy of the audio.
     """
-    fields = [
-        ("model", CFG["transcribe_model"]),
-        ("response_format", "json"),
-        # gpt-transcribe takes languages[] (plural) and replaces `language`.
-        # Constraining it to the two languages we care about improves accuracy.
-        ("languages[]", "en"),
-        ("languages[]", "ja"),
-    ]
-    # The official gpt-transcribe `keywords` field guides recognition of
-    # uncommon words and phrases. Repeated keywords[] form fields encode the
-    # array in the same way as languages[].
-    keywords = CFG.get("domain_keywords") or DEFAULT_DOMAIN_KEYWORDS
-    if not isinstance(keywords, (list, tuple)):
-        keywords = DEFAULT_DOMAIN_KEYWORDS
-    for keyword in keywords:
-        if keyword:
-            fields.append(("keywords[]", str(keyword)))
+    model = CFG["transcribe_model"]
+    fields = [("model", model), ("response_format", "json")]
+    pair = configured_pair()
+    if model.startswith("gpt-4o-"):
+        fields.append(
+            (
+                "prompt",
+                "Speech is in %s or %s. Transcribe verbatim in the original "
+                "language and writing system; do not translate. Context: %s."
+                % (
+                    language_profile(pair[0])["name"],
+                    language_profile(pair[1])["name"],
+                    CFG["domain_context"],
+                ),
+            )
+        )
+    if model == "gpt-transcribe":
+        # These current fields are specific to gpt-transcribe; the faster mini
+        # model rejects them and relies on automatic language detection.
+        for code in pair:
+            fields.append(("languages[]", code))
+        keywords = CFG.get("domain_keywords") or DEFAULT_DOMAIN_KEYWORDS
+        if not isinstance(keywords, (list, tuple)):
+            keywords = DEFAULT_DOMAIN_KEYWORDS
+        for keyword in keywords:
+            if keyword:
+                fields.append(("keywords[]", str(keyword)))
     head = bytearray()
     for name, value in fields:
         head += (
@@ -2853,9 +3398,9 @@ def transcribe(pcm):
     # The preamble is small, so it can grow. The PCM is not: appending it to a
     # bytearray reallocates and copies the whole ~192 KB body, so the parts are
     # measured first and copied once into an exactly sized buffer.
-    body = join_exact((head, pcm, ("\r\n--" + BOUNDARY + "--\r\n").encode()))
+    body = BodyParts((head, pcm, ("\r\n--" + BOUNDARY + "--\r\n").encode()))
 
-    log("stt: POST %d bytes to %s" % (len(body), CFG["transcribe_model"]))
+    log("stt: POST %d bytes to %s" % (body.length, model))
     r = post_with_retry(
         "stt",
         lambda: do_post(
@@ -2864,24 +3409,18 @@ def transcribe(pcm):
             headers=auth_headers({"Content-Type": "multipart/form-data; boundary=" + BOUNDARY}),
         ),
     )
-    data = r.json()
+    try:
+        data = r.json()
+    finally:
+        r.close()
     langs = data.get("languages") or []
     code = langs[0].get("code", "") if langs else ""
-    return data.get("text", ""), code
+    return renderable_text(data.get("text", "")), code
 
 
 def detect_source(text):
-    """Fallback when the API returns no language, e.g. an empty languages[]."""
-    kana = kanji = latin = 0
-    for ch in text:
-        o = ord(ch)
-        if 0x3041 <= o <= 0x30FF:
-            kana += 1
-        elif 0x4E00 <= o <= 0x9FFF:
-            kanji += 1
-        elif 0x41 <= o <= 0x5A or 0x61 <= o <= 0x7A:
-            latin += 1
-    return "ja" if (kana or (kanji and kanji > latin)) else "en"
+    """Compatibility helper returning only the configured source route."""
+    return resolve_route(text)[0] or configured_pair()[0]
 
 
 def ascii_lower(text):
@@ -2907,8 +3446,9 @@ def looks_hallucinated(text):
     return any(ascii_lower(h) in t for h in HALLUCINATIONS)
 
 
-def translate(text, src):
-    src_name, tgt_name = ("Japanese", "English") if src == "ja" else ("English", "Japanese")
+def translate(text, src, tgt):
+    src_name = language_profile(src)["name"]
+    tgt_name = language_profile(tgt)["name"]
     keywords = CFG.get("domain_keywords") or DEFAULT_DOMAIN_KEYWORDS
     if not isinstance(keywords, (list, tuple)):
         keywords = DEFAULT_DOMAIN_KEYWORDS
@@ -2919,11 +3459,11 @@ def translate(text, src):
             {
                 "role": "system",
                 "content": (
-                    "Live EN-JA interpreter for %s. Translate %s to %s. Use "
+                    "Live multilingual interpreter for %s. Translate %s to %s. Use "
                     "canonical spellings: %s. Keep project names, standards, "
-                    "formats, APIs, and acronyms in Latin script. In Japanese "
-                    "STAC context use アセット/カタログ/コレクション/アイテム "
-                    "for asset/catalog/collection/item. Resolve explicit "
+                    "formats, APIs, URLs, numbers, and acronyms accurate. "
+                    "Preserve the natural writing direction and punctuation "
+                    "of the target language. Resolve explicit "
                     "self-corrections (no, wait, actually, scratch that, "
                     "いや, じゃなくて, やっぱり, 訂正) by keeping the corrected "
                     "intent and omitting only superseded words; preserve "
@@ -2953,7 +3493,10 @@ def translate(text, src):
             headers=auth_headers({"Content-Type": "application/json"}),
         ),
     )
-    return r.json()["choices"][0]["message"]["content"]
+    try:
+        return renderable_text(r.json()["choices"][0]["message"]["content"])
+    finally:
+        r.close()
 
 
 # ------------------------------------------------------------------ pipeline
@@ -2981,7 +3524,7 @@ def wait_for_utterance():
         poll_session_controls()
         if not running:
             return
-        held = tail_seq - open_seq if speech_windows else 0
+        held = (tail_seq - open_seq) * FRAME_MS // 1000 if speech_windows else 0
         if held != shown:
             shown = held
             set_status(listening_status(held))
@@ -3067,14 +3610,13 @@ def prepare_chunk(start_seq, end_seq):
         off = 0
         seq += 1
 
-    apply_gain(buf, n)
     log("rec: trimmed %d to %d bytes, %.1fs on the wire" % (total, n, n / (SAMPLE_RATE * 2.0)))
     return memoryview(buf)[:n]
 
 
 def recognize(pcm):
-    """Transcribe a stable PCM copy, returning (text, source) or None."""
-    global last_orig, last_src
+    """Transcribe a stable PCM copy, returning (text, source, target) or None."""
+    global last_orig, last_src, last_trans, last_trans_lang
 
     try:
         text, lang = transcribe(pcm)
@@ -3093,29 +3635,43 @@ def recognize(pcm):
         log("stt: discarded %r (lang=%r)" % (text, lang))
         return None
 
-    # Character inspection is decisive for this two-language app. In a live
-    # Japanese test gpt-transcribe repeatedly returned lang="en" for kana and
-    # kanji, which selected the wrong translation direction and LCD font.
-    src = detect_source(text)
-    log("stt: [%s, api=%r] %s" % (src, lang, text))
+    # Script is decisive when possible; API metadata resolves ambiguous Han
+    # and Latin text. Never coerce a clearly out-of-pair language.
+    src, tgt = resolve_route(text, lang)
+    if not src:
+        detected = script_language(text) or normalize_language_code(lang) or "other"
+        set_status("Detected %s; change pair" % detected.upper(), FG_ALERT)
+        log("stt: rejected out-of-pair source=%s api=%r" % (detected, lang))
+        return None
+    if CFG["debug_content_logs"]:
+        log("stt: [%s, api=%r] %s" % (src, lang, text))
+    else:
+        log("stt: source=%s api=%r chars=%d" % (src, lang, len(text)))
     last_src = src
     last_orig = text
-    # Keep the previous large translation readable until its replacement is
-    # complete; only the compact HEARD preview changes during the next POST.
-    update_display()
-    set_status("JA to EN" if src == "ja" else "EN to JA")
-    return text, src
+    last_trans = ""
+    last_trans_lang = tgt
+    turn = begin_turn(text, src, tgt)
+    set_status("%s to %s" % (language_short(src), language_short(tgt)))
+    return text, src, tgt, turn
 
 
 def finish_translation(recognized):
     """Translate recognized text while both microphone queue slots run."""
     global last_trans, last_trans_lang
 
-    text, src = recognized
-    last_trans = translate(text, src)
-    last_trans_lang = "en" if src == "ja" else "ja"
-    log("tt: %s" % last_trans)
-    update_display()
+    text, src, tgt, turn = recognized
+    try:
+        last_trans = translate(text, src, tgt)
+    except Exception:
+        fail_turn(turn, "Translation failed")
+        raise
+    last_trans_lang = tgt
+    if CFG["debug_content_logs"]:
+        log("tt: %s" % last_trans)
+    else:
+        log("tt: target=%s chars=%d" % (last_trans_lang, len(last_trans)))
+    complete_turn(turn, last_trans)
     gc.collect()
 
 
@@ -3175,9 +3731,11 @@ def probe_channels():
         if not M5.Mic.record(probe, SAMPLE_RATE, True):
             raise RuntimeError("stereo queue failed")
         while M5.Mic.isRecording():
+            M5.update()
+            service_ui()
             time.sleep_ms(20)
-        d1 = channel_dbfs(probe, 0, 2)
-        d2 = channel_dbfs(probe, 1, 2)
+        d1 = normalized_mic_db(channel_dbfs(probe, 0, 2))
+        d2 = normalized_mic_db(channel_dbfs(probe, 1, 2))
         same = 0
         checked = 0
         for i in range(0, len(probe) - 3, 400):
@@ -3190,21 +3748,52 @@ def probe_channels():
 
 
 def setup():
-    global font_ja, font_label, font_source_en, font_trans_en, font_ui
+    global font_ja, font_ko, font_zh, rtl_firmware_abi
+    global font_ar_source, font_ar_translation, font_he_source, font_he_translation
+    global font_label, font_source_en, font_trans_en, font_ui
+    global ui_port_loop, ui_last_tick
     log("boot: translator starting")
-    M5.begin()
+    load_config()
+    # Allocate the large ring before LVGL's timer begins scheduling callbacks.
+    # Session start then only resets indices and queues the first two frames.
+    prepare_capture_storage()
+    # m5ui.init() calls M5.begin() and installs the LVGL display/touch port.
+    # Calling M5.begin() separately would initialize the board twice.
+    m5ui.init()
     try:
-        font_ja = M5.Lcd.FONTS.AlibabaSansJA24
-        font_ui = M5.Lcd.FONTS.Montserrat16
-        font_label = M5.Lcd.FONTS.Montserrat12
-        font_source_en = M5.Lcd.FONTS.Montserrat18
-        font_trans_en = M5.Lcd.FONTS.Montserrat24
+        # UIFlow's timer raises "schedule queue full" whenever a long hardware
+        # call keeps MicroPython busy. Stop only that timer; service_ui() owns
+        # LVGL ticks and task handling in the same loops that pump touch/mic.
+        ui_port_loop = m5ui.event_loop.get_instance()
+        ui_port_loop.timer.deinit()
+    except Exception:
+        ui_port_loop = None
+    ui_last_tick = time.ticks_ms()
+    try:
+        font_ja = getattr(lv, "AlibabaSans_JP24", None)
+        font_ko = getattr(lv, "AlibabaSans_KR24", None)
+        font_zh = getattr(lv, "AlibabaPuHuiTi_CN24", None)
+        font_ui = lv.font_montserrat_16
+        font_label = lv.font_montserrat_14
+        font_source_en = lv.font_montserrat_16
+        font_trans_en = lv.font_montserrat_24
+        try:
+            import translator_rtl
+
+            rtl_firmware_abi = translator_rtl.ABI_VERSION
+            if translator_rtl.BIDI and translator_rtl.ARABIC_SHAPING:
+                font_ar_source = getattr(lv, translator_rtl.ARABIC_SOURCE_FONT, None)
+                font_ar_translation = getattr(lv, translator_rtl.ARABIC_TRANSLATION_FONT, None)
+                font_he_source = getattr(lv, translator_rtl.HEBREW_SOURCE_FONT, None)
+                font_he_translation = getattr(lv, translator_rtl.HEBREW_TRANSLATION_FONT, None)
+        except Exception:
+            rtl_firmware_abi = 0
+            font_ar_source = None
+            font_ar_translation = None
+            font_he_source = None
+            font_he_translation = None
     except Exception as e:
         log("fonts: %r" % e)
-    if font_ja is not None:
-        M5.Lcd.setFont(font_ja)
-    draw_frame()
-    set_status("Booting...")
 
     try:
         import esp32
@@ -3213,12 +3802,15 @@ def setup():
     except Exception:
         pass
 
-    load_config()
+    show_main_screen()
+    set_status(config_error or "Booting...", FG_ALERT if config_error else FG_STATUS)
 
     # Join at boot rather than lazily on the first POST. A dead link should
     # say so on screen, not surface later as an opaque 45 second timeout.
     set_status("Checking Wi-Fi...")
     online = ensure_wifi()
+    if exit_requested:
+        return
     if online:
         set_status("Wi-Fi connected")
     else:
@@ -3233,28 +3825,33 @@ def setup():
         set_status("Connecting to API...")
         prewarm()
 
-    update_display()
     if online:
-        set_status("Tap screen to start")
+        error = pair_render_error()
+        set_status(error if error else "Ready", FG_ALERT if error else FG_STATUS)
     else:
-        set_status("No Wi-Fi, tap to retry", FG_ALERT)
+        set_status("No Wi-Fi, START to retry", FG_ALERT)
 
 
 def loop():
-    global running, fatal, settings_requested
+    global running, fatal, settings_requested, language_requested, stop_requested
     M5.update()
+    service_ui()
+    process_ui_action()
 
-    pos = tap()
-    if pos and hit(pos[0], pos[1], GEAR_HIT_BOX):
-        settings_page()
-        set_status("Tap screen to start" if not running else "Listening...")
-        return
-
-    if BtnPWR.wasClicked() or pos:
-        running = not running
-        fatal = ""
-        log("btn: running=%s" % running)
-        set_status("Starting..." if running else "Paused")
+    if BtnPWR.wasClicked():
+        if running:
+            stop_requested = True
+            running = False
+            set_status("Stopping...", FG_DIM)
+        elif screen_mode == "main":
+            error = pair_render_error()
+            if error:
+                set_status(error, FG_ALERT)
+            else:
+                fatal = ""
+                running = True
+                set_status("Starting...")
+        _set_running_widgets()
 
     if not running:
         return
@@ -3269,7 +3866,7 @@ def loop():
     except SessionCancelled:
         running = False
         log("pipeline: cancelled by user")
-        if not settings_requested:
+        if not settings_requested and not language_requested:
             set_status("Paused")
     except ApiError as e:
         log_exc(e)
@@ -3291,19 +3888,61 @@ def loop():
     if settings_requested:
         settings_requested = False
         settings_page()
-        set_status("Tap screen to start")
+    elif language_requested:
+        language_requested = False
+        language_page()
+    else:
+        _set_running_widgets()
 
 
 def run():
+    global running
+    setup_ok = True
     try:
         setup()
     except Exception as e:
         log_exc(e)
         set_status("SETUP FAILED: %s" % e, FG_ALERT)
-        return
-    while True:
-        loop()
-        time.sleep_ms(20)
+        setup_ok = False
+    try:
+        while setup_ok and not exit_requested:
+            loop()
+            time.sleep_ms(20)
+    except KeyboardInterrupt:
+        log("app: interrupted, cleaning up")
+    finally:
+        running = False
+        try:
+            if pump_armed or M5.Mic.isRecording():
+                end_capture()
+        except Exception as e:
+            log("app: mic cleanup failed %r" % e)
+        try:
+            end_transcript_session()
+        except Exception:
+            pass
+        try:
+            if ui_port_loop is not None:
+                ui_port_loop.scheduled = 0
+            M5.Lcd.lvgl_deinit()
+            lv.mp_lv_deinit_gc()
+        except Exception as e:
+            log("app: LVGL cleanup failed %r" % e)
+    if exit_requested:
+        try:
+            import esp32
+
+            settings = esp32.NVS("uiflow")
+            settings.set_u8("boot_option", 1)
+            settings.commit()
+        except Exception as e:
+            log("app: could not select UIFlow launcher %r" % e)
+        log("app: exit requested; restarting into UIFlow2")
+        _close_log()
+        time.sleep_ms(200)
+        import machine
+
+        machine.reset()
 
 
 run()
